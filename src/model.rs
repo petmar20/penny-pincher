@@ -97,6 +97,7 @@ pub struct Item {
     pub default_unit: Unit,
     pub allow_multipack: bool,
     pub notes: String,
+    pub category_id: Option<i64>,
 }
 
 impl Item {
@@ -105,6 +106,25 @@ impl Item {
     }
 }
 
+/// A group of products within a collection, such as Baking or Home.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Category {
+    pub id: i64,
+    pub data_set_id: i64,
+    pub name: String,
+}
+
+pub const DEFAULT_CATEGORIES: [&str; 3] = ["Essentials", "Baking", "Home"];
+
+/// A brand or kind of a product, such as Kerrygold butter. Prices can be for one variant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Variant {
+    pub id: i64,
+    pub item_id: i64,
+    pub name: String,
+}
+
+/// How a store's prices differ from the shelf price, such as a member discount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoyaltyType {
     None,
@@ -112,16 +132,19 @@ pub enum LoyaltyType {
     Bonus,
     /// Money off or money back. A 5% discount means $100 of goods costs $95.
     Discount,
+    /// Added at the till, such as a delivery service's markup. 25% means $100 of goods costs $125.
+    Surcharge,
 }
 
 impl LoyaltyType {
-    pub const ALL: [LoyaltyType; 3] = [LoyaltyType::None, LoyaltyType::Bonus, LoyaltyType::Discount];
+    pub const ALL: [LoyaltyType; 4] = [LoyaltyType::None, LoyaltyType::Bonus, LoyaltyType::Discount, LoyaltyType::Surcharge];
 
     pub fn id(self) -> i64 {
         match self {
             LoyaltyType::None => 1,
             LoyaltyType::Bonus => 2,
             LoyaltyType::Discount => 3,
+            LoyaltyType::Surcharge => 4,
         }
     }
 
@@ -134,6 +157,7 @@ impl LoyaltyType {
             LoyaltyType::None => "None",
             LoyaltyType::Bonus => "Store rewards",
             LoyaltyType::Discount => "Discount",
+            LoyaltyType::Surcharge => "Surcharge",
         }
     }
 
@@ -142,6 +166,15 @@ impl LoyaltyType {
             LoyaltyType::None => "",
             LoyaltyType::Bonus => "Points or credit you can only spend at this store",
             LoyaltyType::Discount => "Money off your basket, or money back",
+            LoyaltyType::Surcharge => "Added to every price, like a delivery markup",
+        }
+    }
+
+    /// The largest percentage that makes sense for this kind of adjustment.
+    pub fn max_percent(self) -> f64 {
+        match self {
+            LoyaltyType::Surcharge => 1000.0,
+            _ => 99.99,
         }
     }
 
@@ -150,6 +183,7 @@ impl LoyaltyType {
             LoyaltyType::None => 1.0,
             LoyaltyType::Bonus => 100.0 / (100.0 + percent),
             LoyaltyType::Discount => 1.0 - percent / 100.0,
+            LoyaltyType::Surcharge => 1.0 + percent / 100.0,
         }
     }
 
@@ -158,6 +192,7 @@ impl LoyaltyType {
             LoyaltyType::None => 0.0,
             LoyaltyType::Bonus => 100.0 / multiplier - 100.0,
             LoyaltyType::Discount => 100.0 * (1.0 - multiplier),
+            LoyaltyType::Surcharge => 100.0 * (multiplier - 1.0),
         }
     }
 }
@@ -169,17 +204,19 @@ pub struct Source {
     pub data_set_id: i64,
     pub name: String,
     pub loyalty_type: LoyaltyType,
-    /// Multiply a shelf price by this to get what it really costs after loyalty rewards.
+    /// Multiply a shelf price by this to get what it really costs after rewards or surcharges.
     pub loyalty_multiplier: f64,
     pub notes: String,
 }
 
-/// One recorded price. The rows for an item at a store form its history; the newest is current.
+/// One recorded price. The rows for an item, store and variant form its history; the newest is current.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Price {
     pub id: i64,
     pub item_id: i64,
     pub source_id: i64,
+    /// None when the price isn't for a particular brand or kind.
+    pub variant_id: Option<i64>,
     pub price: f64,
     /// Packs in a multipack: "$5 for 4 x 330 ml" has a count of 4.
     pub count: i64,
@@ -217,7 +254,8 @@ mod tests {
 
     #[test]
     fn loyalty_percentages_round_trip() {
-        for loyalty_type in [LoyaltyType::Bonus, LoyaltyType::Discount] {
+        assert!((LoyaltyType::Surcharge.multiplier_from_percent(25.0) - 1.25).abs() < 1e-9);
+        for loyalty_type in [LoyaltyType::Bonus, LoyaltyType::Discount, LoyaltyType::Surcharge] {
             let multiplier = loyalty_type.multiplier_from_percent(5.0);
             assert!((loyalty_type.percent_from_multiplier(multiplier) - 5.0).abs() < 1e-9);
         }

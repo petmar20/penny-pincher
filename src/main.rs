@@ -3,6 +3,7 @@
 
 mod analysis;
 mod app;
+mod converter;
 mod db;
 mod forms;
 mod model;

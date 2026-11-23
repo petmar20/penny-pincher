@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
 use crate::analysis::AgeSettings;
-use crate::model::{DataSet, Item, LoyaltyType, Price, Source};
+use crate::model::{Category, DEFAULT_CATEGORIES, DataSet, Item, LoyaltyType, Price, Source, Variant};
 use crate::units::{Quantity, Unit};
 
 /// Each entry upgrades the schema by one version. Never edit one that has shipped; add a new one.
@@ -61,6 +61,31 @@ const MIGRATIONS: &[&str] = &[r#"
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+"#, r#"
+    CREATE TABLE category (
+        id INTEGER PRIMARY KEY,
+        data_set_id INTEGER NOT NULL REFERENCES data_set(id) ON DELETE CASCADE,
+        name TEXT NOT NULL
+    );
+    CREATE INDEX category_data_set ON category(data_set_id);
+    INSERT INTO category (data_set_id, name)
+        SELECT data_set.id, defaults.name FROM data_set
+        CROSS JOIN (SELECT 'Essentials' AS name UNION ALL SELECT 'Baking' UNION ALL SELECT 'Home') AS defaults;
+
+    ALTER TABLE item ADD COLUMN category_id INTEGER REFERENCES category(id) ON DELETE SET NULL;
+
+    CREATE TABLE variant (
+        id INTEGER PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES item(id) ON DELETE CASCADE,
+        name TEXT NOT NULL
+    );
+    CREATE INDEX variant_item ON variant(item_id);
+
+    -- The newest row for an (item, source, variant) is now the current price.
+    ALTER TABLE price ADD COLUMN variant_id INTEGER REFERENCES variant(id) ON DELETE CASCADE;
+    DROP INDEX price_item_source;
+    CREATE INDEX price_item_source ON price(item_id, source_id, variant_id, modified_at);
+    CREATE INDEX price_variant ON price(variant_id);
 "#];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -68,7 +93,7 @@ const TABLES: [&str; 5] = ["data_set", "item", "source", "price", "setting"];
 
 const PRICE_COLUMNS: &str =
     "price.id, price.item_id, price.source_id, price.price, price.count, price.quantity_in_base_unit, \
-     price.user_unit, price.confirmed_at, price.notes, price.modified_at";
+     price.user_unit, price.confirmed_at, price.notes, price.modified_at, price.variant_id";
 
 pub struct Db {
     conn: Connection,
@@ -156,7 +181,11 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 &values[..6],
             )?;
-            Ok(self.conn.last_insert_rowid())
+            let id = self.conn.last_insert_rowid();
+            for name in DEFAULT_CATEGORIES {
+                self.save_category(&Category { id: 0, data_set_id: id, name: name.to_string() })?;
+            }
+            Ok(id)
         } else {
             self.conn.execute(
                 "UPDATE data_set SET name = ?1, currency_code = ?2, allow_metric = ?3, allow_imperial = ?4,
@@ -180,11 +209,39 @@ impl Db {
         )?)
     }
 
+    // Categories
+
+    pub fn categories(&self, data_set_id: i64) -> Result<Vec<Category>> {
+        let mut statement =
+            self.conn.prepare("SELECT id, data_set_id, name FROM category WHERE data_set_id = ?1 ORDER BY name COLLATE NOCASE")?;
+        let rows = statement.query_map([data_set_id], |row| {
+            Ok(Category { id: row.get(0)?, data_set_id: row.get(1)?, name: row.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn save_category(&self, category: &Category) -> Result<i64> {
+        if category.id == 0 {
+            self.conn
+                .execute("INSERT INTO category (data_set_id, name) VALUES (?1, ?2)", params![category.data_set_id, category.name])?;
+            Ok(self.conn.last_insert_rowid())
+        } else {
+            self.conn.execute("UPDATE category SET name = ?1 WHERE id = ?2", params![category.name, category.id])?;
+            Ok(category.id)
+        }
+    }
+
+    /// Its products stay, without a category.
+    pub fn delete_category(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM category WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     // Products
 
     pub fn items(&self, data_set_id: i64) -> Result<Vec<Item>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, data_set_id, name, default_unit, allow_multipack, notes
+            "SELECT id, data_set_id, name, default_unit, allow_multipack, notes, category_id
              FROM item WHERE data_set_id = ?1 ORDER BY name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([data_set_id], |row| {
@@ -195,26 +252,74 @@ impl Db {
                 default_unit: unit_column(row, 3)?,
                 allow_multipack: row.get(4)?,
                 notes: row.get(5)?,
+                category_id: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn save_item(&self, item: &Item) -> Result<i64> {
-        let values = params![item.data_set_id, item.name, item.default_unit.id(), item.allow_multipack, item.notes, item.id];
+        let values = params![
+            item.data_set_id,
+            item.name,
+            item.default_unit.id(),
+            item.allow_multipack,
+            item.notes,
+            item.category_id,
+            item.id,
+        ];
         if item.id == 0 {
             self.conn.execute(
-                "INSERT INTO item (data_set_id, name, default_unit, allow_multipack, notes) VALUES (?1, ?2, ?3, ?4, ?5)",
-                &values[..5],
+                "INSERT INTO item (data_set_id, name, default_unit, allow_multipack, notes, category_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &values[..6],
             )?;
             Ok(self.conn.last_insert_rowid())
         } else {
             self.conn.execute(
-                "UPDATE item SET data_set_id = ?1, name = ?2, default_unit = ?3, allow_multipack = ?4, notes = ?5 WHERE id = ?6",
+                "UPDATE item SET data_set_id = ?1, name = ?2, default_unit = ?3, allow_multipack = ?4, notes = ?5,
+                 category_id = ?6 WHERE id = ?7",
                 values,
             )?;
             Ok(item.id)
         }
+    }
+
+    // Variants
+
+    pub fn variants(&self, item_id: i64) -> Result<Vec<Variant>> {
+        let mut statement =
+            self.conn.prepare("SELECT id, item_id, name FROM variant WHERE item_id = ?1 ORDER BY name COLLATE NOCASE")?;
+        let rows = statement.query_map([item_id], |row| Ok(Variant { id: row.get(0)?, item_id: row.get(1)?, name: row.get(2)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Makes the item's variants match `variants`: renames existing ones (by id), adds ones with id 0,
+    /// and deletes the rest along with their prices.
+    pub fn replace_variants(&mut self, item_id: i64, variants: &[Variant]) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        let kept: Vec<i64> = variants.iter().map(|variant| variant.id).filter(|id| *id != 0).collect();
+        let existing: Vec<i64> = {
+            let mut statement = transaction.prepare("SELECT id FROM variant WHERE item_id = ?1")?;
+            statement.query_map([item_id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for id in existing.into_iter().filter(|id| !kept.contains(id)) {
+            transaction.execute("DELETE FROM variant WHERE id = ?1", [id])?;
+        }
+        for variant in variants {
+            if variant.id == 0 {
+                transaction.execute("INSERT INTO variant (item_id, name) VALUES (?1, ?2)", params![item_id, variant.name])?;
+            } else {
+                transaction
+                    .execute("UPDATE variant SET name = ?1 WHERE id = ?2 AND item_id = ?3", params![variant.name, variant.id, item_id])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn count_prices_for_variant(&self, variant_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM price WHERE variant_id = ?1", [variant_id], |row| row.get(0))?)
     }
 
     pub fn delete_item(&self, id: i64) -> Result<()> {
@@ -283,13 +388,14 @@ impl Db {
 
     // Prices
 
-    /// The newest price for the item at each store that has one.
+    /// The newest price for the item for each store and variant that has one.
     pub fn current_prices(&self, item_id: i64) -> Result<Vec<Price>> {
         let sql = format!(
             "SELECT {PRICE_COLUMNS} FROM price
              WHERE price.item_id = ?1 AND price.id = (
                  SELECT newest.id FROM price AS newest
                  WHERE newest.item_id = price.item_id AND newest.source_id = price.source_id
+                   AND newest.variant_id IS price.variant_id
                  ORDER BY newest.modified_at DESC, newest.id DESC LIMIT 1
              )"
         );
@@ -298,25 +404,27 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Every price recorded for the item at the store, newest first.
-    pub fn price_history(&self, item_id: i64, source_id: i64) -> Result<Vec<Price>> {
+    /// Every price recorded for the item and variant at the store, newest first.
+    pub fn price_history(&self, item_id: i64, source_id: i64, variant_id: Option<i64>) -> Result<Vec<Price>> {
         let sql = format!(
-            "SELECT {PRICE_COLUMNS} FROM price WHERE item_id = ?1 AND source_id = ?2
+            "SELECT {PRICE_COLUMNS} FROM price WHERE item_id = ?1 AND source_id = ?2 AND variant_id IS ?3
              ORDER BY modified_at DESC, id DESC"
         );
         let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map([item_id, source_id], price_from_row)?;
+        let rows = statement.query_map(params![item_id, source_id, variant_id], price_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Records a price. It becomes the current price for its item and store.
+    /// Records a price. It becomes the current price for its item, store and variant.
     pub fn add_price(&self, price: &Price) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO price (item_id, source_id, price, count, quantity_in_base_unit, user_unit, confirmed_at, notes, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO price (item_id, source_id, variant_id, price, count, quantity_in_base_unit, user_unit,
+                                confirmed_at, notes, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 price.item_id,
                 price.source_id,
+                price.variant_id,
                 price.price,
                 price.count,
                 price.quantity.in_base_unit(),
@@ -334,9 +442,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_price_history(&self, item_id: i64, source_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM price WHERE item_id = ?1 AND source_id = ?2", [item_id, source_id])?;
+    pub fn delete_price_history(&self, item_id: i64, source_id: i64, variant_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM price WHERE item_id = ?1 AND source_id = ?2 AND variant_id IS ?3",
+            params![item_id, source_id, variant_id],
+        )?;
         Ok(())
     }
 
@@ -434,6 +544,7 @@ fn price_from_row(row: &Row) -> rusqlite::Result<Price> {
         confirmed_at: row.get(7)?,
         notes: row.get(8)?,
         modified_at: row.get(9)?,
+        variant_id: row.get(10)?,
     })
 }
 
@@ -452,6 +563,7 @@ pub mod tests {
             default_unit: Unit::Oz,
             allow_multipack: false,
             notes: String::new(),
+            category_id: None,
         };
         item.id = db.save_item(&item).unwrap();
         let mut walmart = Source {
@@ -475,6 +587,7 @@ pub mod tests {
             id: 0,
             item_id: item.id,
             source_id: source.id,
+            variant_id: None,
             price: amount,
             count: 1,
             quantity: Quantity::new(1.0, Unit::Lb),
@@ -498,7 +611,34 @@ pub mod tests {
         assert_eq!(current[0].price, 4.79);
         assert_eq!(current[0].quantity.unit, Unit::Lb);
         assert!((current[0].quantity.value - 1.0).abs() < 1e-9);
-        assert_eq!(db.price_history(item.id, walmart.id).unwrap().len(), 2);
+        assert_eq!(db.price_history(item.id, walmart.id, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn each_variant_has_its_own_current_price() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (_, item, walmart, _) = sample(&db);
+        db.replace_variants(item.id, &[Variant { id: 0, item_id: item.id, name: "Kerrygold".into() }]).unwrap();
+        let kerrygold = db.variants(item.id).unwrap()[0].id;
+
+        db.add_price(&butter_price(&item, &walmart, 4.49, 1000)).unwrap();
+        db.add_price(&Price { variant_id: Some(kerrygold), ..butter_price(&item, &walmart, 6.99, 2000) }).unwrap();
+        assert_eq!(db.current_prices(item.id).unwrap().len(), 2);
+        assert_eq!(db.price_history(item.id, walmart.id, Some(kerrygold)).unwrap().len(), 1);
+
+        // Removing the variant removes its prices.
+        db.replace_variants(item.id, &[]).unwrap();
+        let current = db.current_prices(item.id).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].price, 4.49);
+    }
+
+    #[test]
+    fn new_collections_get_default_categories() {
+        let db = Db::open_in_memory().unwrap();
+        let (data_set, ..) = sample(&db);
+        let names: Vec<String> = db.categories(data_set.id).unwrap().into_iter().map(|category| category.name).collect();
+        assert_eq!(names, ["Baking", "Essentials", "Home"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Compares an item's current prices across stores.
 
-use crate::model::{Price, Source};
+use crate::model::{Price, Source, Variant};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AgeSettings {
@@ -36,9 +36,10 @@ pub enum Judgement {
 pub struct ComparedPrice {
     pub price: Price,
     pub source_name: String,
+    pub variant_name: Option<String>,
     pub age_days: i64,
     pub age_class: AgeClass,
-    /// After loyalty rewards and the inflation adjustment for old prices.
+    /// After store discounts or surcharges and the inflation adjustment for old prices.
     pub adjusted_price: f64,
     pub adjusted_price_per_base_unit: f64,
     pub judgement: Judgement,
@@ -47,6 +48,14 @@ pub struct ComparedPrice {
 impl ComparedPrice {
     pub fn is_adjusted(&self) -> bool {
         (self.adjusted_price - self.price.price).abs() > 1e-9
+    }
+
+    /// "Walmart" or "Walmart · Kerrygold".
+    pub fn title(&self) -> String {
+        match &self.variant_name {
+            Some(variant) => format!("{} · {variant}", self.source_name),
+            None => self.source_name.clone(),
+        }
     }
 }
 
@@ -58,8 +67,14 @@ pub struct Thresholds {
     pub bad_above: f64,
 }
 
-/// `prices` are the current prices for one item, one per store. The result is cheapest first.
-pub fn compare(prices: &[Price], sources: &[Source], settings: &AgeSettings, now_millis: i64) -> (Vec<ComparedPrice>, Option<Thresholds>) {
+/// `prices` are the current prices for one item, one per store and variant. The result is cheapest first.
+pub fn compare(
+    prices: &[Price],
+    sources: &[Source],
+    variants: &[Variant],
+    settings: &AgeSettings,
+    now_millis: i64,
+) -> (Vec<ComparedPrice>, Option<Thresholds>) {
     let mut compared: Vec<ComparedPrice> = prices
         .iter()
         .filter_map(|price| {
@@ -77,6 +92,10 @@ pub fn compare(prices: &[Price], sources: &[Source], settings: &AgeSettings, now
             Some(ComparedPrice {
                 price: price.clone(),
                 source_name: source.name.clone(),
+                variant_name: price
+                    .variant_id
+                    .and_then(|id| variants.iter().find(|variant| variant.id == id))
+                    .map(|variant| variant.name.clone()),
                 age_days,
                 age_class,
                 adjusted_price,
@@ -89,7 +108,7 @@ pub fn compare(prices: &[Price], sources: &[Source], settings: &AgeSettings, now
     compared.sort_by(|a, b| {
         a.adjusted_price_per_base_unit
             .total_cmp(&b.adjusted_price_per_base_unit)
-            .then_with(|| a.source_name.to_lowercase().cmp(&b.source_name.to_lowercase()))
+            .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
     });
 
     let recent: Vec<f64> = compared
@@ -167,6 +186,7 @@ mod tests {
             id: source_id,
             item_id: 1,
             source_id,
+            variant_id: None,
             price: amount,
             count: 1,
             quantity: Quantity::new(ounces, Unit::Oz),
@@ -182,7 +202,7 @@ mod tests {
         let sources = [source(1, "Walmart", 1.0), source(2, "Kroger", 1.0)];
         // 16 oz for $4.49 vs 8 oz for $2.00: the small pack is cheaper per ounce.
         let prices = [price(1, 4.49, 16.0, now), price(2, 2.00, 8.0, now)];
-        let (compared, thresholds) = compare(&prices, &sources, &AgeSettings::default(), now);
+        let (compared, thresholds) = compare(&prices, &sources, &[], &AgeSettings::default(), now);
         assert_eq!(compared[0].source_name, "Kroger");
         assert!(thresholds.is_none());
     }
@@ -192,9 +212,20 @@ mod tests {
         let now = 1000 * DAY;
         let sources = [source(1, "Walmart", 1.0), source(2, "Costco", 0.9)];
         let prices = [price(1, 4.00, 16.0, now), price(2, 4.20, 16.0, now)];
-        let (compared, _) = compare(&prices, &sources, &AgeSettings::default(), now);
+        let (compared, _) = compare(&prices, &sources, &[], &AgeSettings::default(), now);
         assert_eq!(compared[0].source_name, "Costco");
         assert!((compared[0].adjusted_price - 3.78).abs() < 1e-9);
+    }
+
+    #[test]
+    fn applies_surcharge() {
+        let now = 1000 * DAY;
+        // Instacart-style 25% markup makes a $3.50 shelf price cost $4.375.
+        let sources = [source(1, "Walmart", 1.0), source(2, "Delivery", 1.25)];
+        let prices = [price(1, 4.00, 16.0, now), price(2, 3.50, 16.0, now)];
+        let (compared, _) = compare(&prices, &sources, &[], &AgeSettings::default(), now);
+        assert_eq!(compared[0].source_name, "Walmart");
+        assert!((compared[1].adjusted_price - 4.375).abs() < 1e-9);
     }
 
     #[test]
@@ -208,7 +239,7 @@ mod tests {
             price(3, 3.0, 1.0, now - 60 * DAY),
             price(4, 0.5, 1.0, now - 400 * DAY),
         ];
-        let (compared, thresholds) = compare(&prices, &sources, &settings, now);
+        let (compared, thresholds) = compare(&prices, &sources, &[], &settings, now);
         let stale = compared.iter().find(|price| price.source_name == "Store 3").unwrap();
         assert_eq!(stale.age_class, AgeClass::Stale);
         assert!(stale.adjusted_price > 3.0);

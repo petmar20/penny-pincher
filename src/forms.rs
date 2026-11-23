@@ -4,7 +4,7 @@
 use egui::{Color32, RichText, Ui};
 
 use crate::analysis::{self, AgeSettings, ComparedPrice, Judgement, Thresholds};
-use crate::model::{DataSet, Item, LoyaltyType, Price, Source, now_millis};
+use crate::model::{Category, DataSet, Item, LoyaltyType, Price, Source, Variant, now_millis};
 use crate::money::{self, CURRENCIES, parse_number};
 use crate::units::{self, QuantityType, Quantity, Unit, format_number};
 
@@ -141,22 +141,73 @@ impl DataSetForm {
 
 pub struct ItemForm {
     pub draft: Item,
+    /// Edited in place; id 0 for ones added in this form.
+    pub variants: Vec<Variant>,
+    /// Existing variants with prices, to warn before removing them.
+    variants_with_prices: Vec<i64>,
+    original_variants: Vec<Variant>,
     has_prices: bool,
     pub error: Option<String>,
 }
 
 impl ItemForm {
-    pub fn new(item: Item, has_prices: bool) -> Self {
-        ItemForm { draft: item, has_prices, error: None }
+    pub fn new(item: Item, has_prices: bool, variants: Vec<Variant>, variants_with_prices: Vec<i64>) -> Self {
+        ItemForm {
+            draft: item,
+            original_variants: variants.clone(),
+            variants,
+            variants_with_prices,
+            has_prices,
+            error: None,
+        }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, data_set: &DataSet, others: &[Item]) -> Outcome {
+    pub fn show(&mut self, ui: &mut Ui, data_set: &DataSet, others: &[Item], categories: &[Category]) -> Outcome {
         let is_new = self.draft.id == 0;
         ui.heading(if is_new { "New product" } else { "Edit product" });
         ui.add_space(6.0);
         egui::Grid::new("item_form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Name");
             name_field(ui, &mut self.draft.name);
+            ui.end_row();
+
+            ui.label("Category");
+            let category_name = |id: Option<i64>| {
+                id.and_then(|id| categories.iter().find(|category| category.id == id))
+                    .map_or("None".to_string(), |category| category.name.clone())
+            };
+            egui::ComboBox::from_id_salt("item_category")
+                .selected_text(category_name(self.draft.category_id))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.draft.category_id, None, "None");
+                    for category in categories {
+                        ui.selectable_value(&mut self.draft.category_id, Some(category.id), &category.name);
+                    }
+                });
+            ui.end_row();
+
+            ui.label("Variants");
+            ui.vertical(|ui| {
+                ui.weak("Brands or kinds, like Kerrygold or unsalted.");
+                let mut remove = None;
+                for (index, variant) in self.variants.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut variant.name).char_limit(NAME_LIMIT).desired_width(220.0));
+                        if ui.button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    self.variants.remove(index);
+                }
+                if ui.button("Add variant").clicked() {
+                    self.variants.push(Variant { id: 0, item_id: self.draft.id, name: String::new() });
+                }
+                for removed in self.removed_variants_with_prices() {
+                    ui.colored_label(error_color(ui), format!("Saving deletes the prices for {removed}."));
+                }
+            });
             ui.end_row();
 
             ui.label("Sold by");
@@ -194,18 +245,86 @@ impl ItemForm {
 
         let outcome = buttons(ui, !is_new, "Delete product");
         if matches!(outcome, Outcome::Save) {
-            let name = self.draft.name.trim();
+            self.error = self.apply(others);
+            if self.error.is_some() {
+                return Outcome::Open;
+            }
+        }
+        outcome
+    }
+
+    fn removed_variants_with_prices(&self) -> Vec<String> {
+        self.original_variants
+            .iter()
+            .filter(|original| self.variants_with_prices.contains(&original.id))
+            .filter(|original| !self.variants.iter().any(|variant| variant.id == original.id))
+            .map(|original| original.name.clone())
+            .collect()
+    }
+
+    fn apply(&mut self, others: &[Item]) -> Option<String> {
+        let name = self.draft.name.trim();
+        if name.is_empty() {
+            return Some("Enter a name.".into());
+        }
+        if is_name_taken(name, self.draft.id, others.iter().map(|other| (other.id, other.name.as_str()))) {
+            return Some("There's already a product with this name.".into());
+        }
+        self.draft.name = name.to_string();
+
+        // Blank new rows are just ignored; a blank existing one is probably a mistake.
+        self.variants.retain(|variant| variant.id != 0 || !variant.name.trim().is_empty());
+        for variant in &mut self.variants {
+            variant.name = variant.name.trim().to_string();
+        }
+        if self.variants.iter().any(|variant| variant.name.is_empty()) {
+            return Some("Give each variant a name, or remove it.".into());
+        }
+        for (index, variant) in self.variants.iter().enumerate() {
+            if self.variants[..index].iter().any(|other| other.name.eq_ignore_ascii_case(&variant.name)) {
+                return Some(format!("{} is listed twice.", variant.name));
+            }
+        }
+        None
+    }
+}
+
+// Categories
+
+pub struct CategoryForm {
+    pub draft: Category,
+    pub error: Option<String>,
+}
+
+impl CategoryForm {
+    pub fn new(category: Category) -> Self {
+        CategoryForm { draft: category, error: None }
+    }
+
+    pub fn show(&mut self, ui: &mut Ui, others: &[Category]) -> Outcome {
+        let is_new = self.draft.id == 0;
+        ui.heading(if is_new { "New category" } else { "Rename category" });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            name_field(ui, &mut self.draft.name);
+        });
+        error_text(ui, &self.error);
+
+        let outcome = buttons(ui, !is_new, "Delete category");
+        if matches!(outcome, Outcome::Save) {
+            let name = self.draft.name.trim().to_string();
             self.error = if name.is_empty() {
                 Some("Enter a name.".into())
-            } else if is_name_taken(name, self.draft.id, others.iter().map(|other| (other.id, other.name.as_str()))) {
-                Some("There's already a product with this name.".into())
+            } else if is_name_taken(&name, self.draft.id, others.iter().map(|other| (other.id, other.name.as_str()))) {
+                Some("There's already a category with this name.".into())
             } else {
                 None
             };
             if self.error.is_some() {
                 return Outcome::Open;
             }
-            self.draft.name = name.to_string();
+            self.draft.name = name;
         }
         outcome
     }
@@ -254,7 +373,7 @@ impl SourceForm {
             name_field(ui, &mut self.draft.name);
             ui.end_row();
 
-            ui.label("Loyalty scheme");
+            ui.label("Price adjustment");
             ui.vertical(|ui| {
                 for option in LoyaltyType::ALL {
                     ui.radio_value(&mut self.draft.loyalty_type, option, option.label());
@@ -266,9 +385,9 @@ impl SourceForm {
             ui.end_row();
 
             if self.draft.loyalty_type != LoyaltyType::None {
-                ui.label("Reward");
+                ui.label("Amount");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.percent).desired_width(60.0).char_limit(8));
+                    ui.add(egui::TextEdit::singleline(&mut self.percent).desired_width(80.0).char_limit(8));
                     ui.label("%");
                 });
                 ui.end_row();
@@ -301,8 +420,10 @@ impl SourceForm {
         let multiplier = match self.draft.loyalty_type {
             LoyaltyType::None => 1.0,
             loyalty_type => match parse_number(&self.percent) {
-                Some(percent) if (0.0..100.0).contains(&percent) => loyalty_type.multiplier_from_percent(percent),
-                _ => return Some("Enter a reward between 0 and 100%.".into()),
+                Some(percent) if (0.0..=loyalty_type.max_percent()).contains(&percent) => {
+                    loyalty_type.multiplier_from_percent(percent)
+                }
+                _ => return Some(format!("Enter a percentage from 0 to {}.", format_number(loyalty_type.max_percent(), 2))),
             },
         };
         self.draft.name = name;
@@ -318,12 +439,14 @@ pub struct PriceContext<'a> {
     pub data_set: &'a DataSet,
     pub item: &'a Item,
     pub sources: &'a [Source],
+    pub variants: &'a [Variant],
     pub comparison: &'a [ComparedPrice],
     pub thresholds: Option<Thresholds>,
 }
 
 pub struct PriceForm {
     pub source_id: i64,
+    pub variant_id: Option<i64>,
     price: String,
     count: String,
     size: String,
@@ -334,10 +457,11 @@ pub struct PriceForm {
 }
 
 impl PriceForm {
-    /// Starts from the store's current price when it has one, so only what changed needs typing.
-    pub fn new(context: &PriceContext, source_id: i64) -> Self {
+    /// Starts from the current price when there is one, so only what changed needs typing.
+    pub fn new(context: &PriceContext, source_id: i64, variant_id: Option<i64>) -> Self {
         let mut form = PriceForm {
             source_id,
+            variant_id,
             price: String::new(),
             count: String::new(),
             size: String::new(),
@@ -351,7 +475,10 @@ impl PriceForm {
     }
 
     fn current<'a>(&self, context: &'a PriceContext) -> Option<&'a ComparedPrice> {
-        context.comparison.iter().find(|compared| compared.price.source_id == self.source_id)
+        context
+            .comparison
+            .iter()
+            .find(|compared| compared.price.source_id == self.source_id && compared.price.variant_id == self.variant_id)
     }
 
     fn fill_from_current(&mut self, context: &PriceContext) {
@@ -395,6 +522,7 @@ impl PriceForm {
             id: 0,
             item_id: context.item.id,
             source_id: self.source_id,
+            variant_id: self.variant_id,
             price,
             count,
             quantity: Quantity::new(size, self.unit),
@@ -420,10 +548,28 @@ impl PriceForm {
                         ui.selectable_value(&mut self.source_id, source.id, &source.name);
                     }
                 });
-            if self.source_id != previous_source {
+            ui.end_row();
+
+            let previous_variant = self.variant_id;
+            if !context.variants.is_empty() {
+                ui.label("Variant");
+                let variant_name = |id: Option<i64>| {
+                    id.and_then(|id| context.variants.iter().find(|variant| variant.id == id))
+                        .map_or("Any".to_string(), |variant| variant.name.clone())
+                };
+                egui::ComboBox::from_id_salt("price_variant")
+                    .selected_text(variant_name(self.variant_id))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.variant_id, None, "Any");
+                        for variant in context.variants {
+                            ui.selectable_value(&mut self.variant_id, Some(variant.id), &variant.name);
+                        }
+                    });
+                ui.end_row();
+            }
+            if self.source_id != previous_source || self.variant_id != previous_variant {
                 self.fill_from_current(context);
             }
-            ui.end_row();
 
             ui.label("Price");
             let price_field = ui.add(egui::TextEdit::singleline(&mut self.price).desired_width(120.0).char_limit(12).hint_text(currency.symbol.trim()));
@@ -508,26 +654,35 @@ impl PriceForm {
                     format_unit_price(currency, current.adjusted_price_per_base_unit, denominator)
                 ));
             }
-            let cheapest_elsewhere = context
+            let is_this_price =
+                |compared: &&ComparedPrice| compared.price.source_id == self.source_id && compared.price.variant_id == self.variant_id;
+            let cheapest_other = context
                 .comparison
                 .iter()
-                .find(|compared| compared.price.source_id != self.source_id && compared.age_class != analysis::AgeClass::Ancient);
-            if let Some(cheapest) = cheapest_elsewhere {
+                .find(|compared| !is_this_price(compared) && compared.age_class != analysis::AgeClass::Ancient);
+            if let Some(cheapest) = cheapest_other {
                 let difference = per_base_unit / cheapest.adjusted_price_per_base_unit - 1.0;
+                let name = cheapest.title();
                 let comparison = if difference.abs() < 0.005 {
-                    format!("Same as {}", cheapest.source_name)
+                    format!("Same as {name}")
                 } else if difference < 0.0 {
-                    format!("{:.0}% cheaper than {}", -difference * 100.0, cheapest.source_name)
+                    format!("{:.0}% cheaper than {name}", -difference * 100.0)
                 } else {
-                    format!("{:.0}% more than {}", difference * 100.0, cheapest.source_name)
+                    format!("{:.0}% more than {name}", difference * 100.0)
                 };
                 ui.label(format!(
                     "{comparison} ({})",
                     format_unit_price(currency, cheapest.adjusted_price_per_base_unit, denominator)
                 ));
             }
-            if source.loyalty_type != LoyaltyType::None {
-                ui.weak("Includes this store's loyalty reward.");
+            match source.loyalty_type {
+                LoyaltyType::None => {}
+                LoyaltyType::Surcharge => {
+                    ui.weak("Includes this store's surcharge.");
+                }
+                _ => {
+                    ui.weak("Includes this store's discount.");
+                }
             }
         });
     }

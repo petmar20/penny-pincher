@@ -6,12 +6,13 @@ use anyhow::Result;
 use egui::{RichText, Ui};
 
 use crate::analysis::{self, AgeClass, AgeSettings, ComparedPrice, Thresholds};
+use crate::converter::Converter;
 use crate::db::{self, Db};
 use crate::forms::{
-    self, DataSetForm, ItemForm, Outcome, PriceContext, PriceForm, SettingsForm, SourceForm, format_unit_price,
-    judgement_badge,
+    self, CategoryForm, DataSetForm, ItemForm, Outcome, PriceContext, PriceForm, SettingsForm, SourceForm,
+    format_unit_price, judgement_badge,
 };
-use crate::model::{DataSet, Item, LoyaltyType, Price, Source, now_millis};
+use crate::model::{Category, DataSet, Item, LoyaltyType, Price, Source, Variant, now_millis};
 use crate::units::{self, Unit};
 
 pub struct PennyApp {
@@ -19,9 +20,12 @@ pub struct PennyApp {
     age_settings: AgeSettings,
     data_sets: Vec<DataSet>,
     data_set_id: Option<i64>,
+    categories: Vec<Category>,
     items: Vec<Item>,
     sources: Vec<Source>,
     item_id: Option<i64>,
+    /// Variants of the selected product.
+    variants: Vec<Variant>,
     search: String,
     /// Current prices for the selected product, cheapest first.
     comparison: Vec<ComparedPrice>,
@@ -35,12 +39,23 @@ enum Dialog {
     DataSet(DataSetForm),
     Item(ItemForm),
     Source(SourceForm),
+    Category(CategoryForm),
     Price(PriceForm),
-    History { item_id: i64, source_id: i64 },
+    History(PriceKey),
     Stores,
+    Categories,
+    Converter(Converter),
     Settings(SettingsForm),
     Confirm(Confirm),
     About,
+}
+
+/// Identifies one line of prices: a product (and maybe a variant of it) at a store.
+#[derive(Clone, Copy)]
+struct PriceKey {
+    item_id: i64,
+    source_id: i64,
+    variant_id: Option<i64>,
 }
 
 struct Confirm {
@@ -54,8 +69,9 @@ enum ConfirmAction {
     DeleteDataSet(i64),
     DeleteItem(i64),
     DeleteSource(i64),
-    DeletePrice { id: i64, item_id: i64, source_id: i64 },
-    DeletePriceHistory { item_id: i64, source_id: i64 },
+    DeleteCategory(i64),
+    DeletePrice { id: i64, key: PriceKey },
+    DeletePriceHistory(PriceKey),
     Restore(PathBuf),
 }
 
@@ -82,9 +98,11 @@ impl PennyApp {
             db,
             data_sets: Vec::new(),
             data_set_id,
+            categories: Vec::new(),
             items: Vec::new(),
             sources: Vec::new(),
             item_id,
+            variants: Vec::new(),
             search: String::new(),
             comparison: Vec::new(),
             thresholds: None,
@@ -103,9 +121,11 @@ impl PennyApp {
             self.data_set_id = self.data_sets.first().map(|data_set| data_set.id);
         }
 
+        self.categories.clear();
         self.items.clear();
         self.sources.clear();
         if let Some(data_set_id) = self.data_set_id {
+            self.categories = self.db.categories(data_set_id)?;
             self.items = self.db.items(data_set_id)?;
             self.sources = self.db.sources(data_set_id)?;
         }
@@ -113,12 +133,15 @@ impl PennyApp {
             self.item_id = None;
         }
 
+        self.variants.clear();
         self.comparison.clear();
         self.thresholds = None;
         self.unit_price_denominator = None;
         if let (Some(item), Some(data_set)) = (self.item().cloned(), self.data_set().cloned()) {
+            self.variants = self.db.variants(item.id)?;
             let prices = self.db.current_prices(item.id)?;
-            let (comparison, thresholds) = analysis::compare(&prices, &self.sources, &self.age_settings, now_millis());
+            let (comparison, thresholds) =
+                analysis::compare(&prices, &self.sources, &self.variants, &self.age_settings, now_millis());
             let per_base_unit: Vec<f64> = comparison.iter().map(|compared| compared.adjusted_price_per_base_unit).collect();
             let candidates = data_set.units_like(data_set.usable_unit(item.default_unit));
             self.unit_price_denominator = units::friendly_denominator(&candidates, &per_base_unit, data_set.currency().decimals);
@@ -157,14 +180,15 @@ impl PennyApp {
             data_set: self.data_set()?,
             item: self.item()?,
             sources: &self.sources,
+            variants: &self.variants,
             comparison: &self.comparison,
             thresholds: self.thresholds,
         })
     }
 
-    fn open_price_form(&mut self, source_id: i64) {
+    fn open_price_form(&mut self, source_id: i64, variant_id: Option<i64>) {
         if let Some(context) = self.price_context() {
-            self.dialog = Some(Dialog::Price(PriceForm::new(&context, source_id)));
+            self.dialog = Some(Dialog::Price(PriceForm::new(&context, source_id, variant_id)));
         }
     }
 
@@ -176,7 +200,30 @@ impl PennyApp {
             default_unit: data_set.units_for(units::QuantityType::Weight, false)[0],
             allow_multipack: false,
             notes: String::new(),
+            category_id: None,
         }
+    }
+
+    fn open_item_form(&mut self, item: Item) {
+        match self.item_form(item) {
+            Ok(form) => self.dialog = Some(Dialog::Item(form)),
+            Err(error) => self.notice = Some(Notice { text: format!("{error:#}"), is_error: true, undo_price_id: None }),
+        }
+    }
+
+    fn item_form(&self, item: Item) -> Result<ItemForm> {
+        if item.id == 0 {
+            return Ok(ItemForm::new(item, false, Vec::new(), Vec::new()));
+        }
+        let has_prices = self.db.count_prices_for_item(item.id)? > 0;
+        let variants = self.db.variants(item.id)?;
+        let mut variants_with_prices = Vec::new();
+        for variant in &variants {
+            if self.db.count_prices_for_variant(variant.id)? > 0 {
+                variants_with_prices.push(variant.id);
+            }
+        }
+        Ok(ItemForm::new(item, has_prices, variants, variants_with_prices))
     }
 
     fn new_source(&self, data_set_id: i64) -> Source {
@@ -225,6 +272,10 @@ impl PennyApp {
                         ui.close();
                         self.dialog = Some(Dialog::DataSet(DataSetForm::new(data_set)));
                     }
+                    if self.data_set_id.is_some() && ui.button("Categories…").clicked() {
+                        ui.close();
+                        self.dialog = Some(Dialog::Categories);
+                    }
                 });
                 ui.menu_button("Stores", |ui| {
                     if ui.button("Manage stores…").clicked() {
@@ -236,6 +287,12 @@ impl PennyApp {
                     {
                         ui.close();
                         self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source(data_set_id))));
+                    }
+                });
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("Unit converter…").clicked() {
+                        ui.close();
+                        self.dialog = Some(Dialog::Converter(Converter::default()));
                     }
                 });
                 ui.menu_button("Help", |ui| {
@@ -299,13 +356,14 @@ impl PennyApp {
     fn products_panel(&mut self, ui: &mut Ui) {
         let Some(data_set) = self.data_set().cloned() else { return };
         let mut clicked = None;
+        let mut add = false;
         egui::Panel::left("products").resizable(true).default_size(240.0).show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("Products");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Add").clicked() {
-                        self.dialog = Some(Dialog::Item(ItemForm::new(self.new_item(&data_set), false)));
+                        add = true;
                     }
                 });
             });
@@ -313,16 +371,48 @@ impl PennyApp {
             ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 let search = self.search.trim().to_lowercase();
-                for item in self.items.iter().filter(|item| item.name.to_lowercase().contains(&search)) {
-                    let selected = Some(item.id) == self.item_id;
-                    let label = egui::Button::selectable(selected, &item.name)
-                        .min_size(egui::vec2(ui.available_width(), crate::touch::TAP_HEIGHT));
-                    if ui.add(label).clicked() {
-                        clicked = Some(item.id);
+                let matches = |item: &&Item| item.name.to_lowercase().contains(&search);
+
+                // Each category in turn, then products without one.
+                let mut groups: Vec<(&str, Vec<&Item>)> = self
+                    .categories
+                    .iter()
+                    .map(|category| {
+                        let items = self.items.iter().filter(|item| item.category_id == Some(category.id)).filter(matches).collect();
+                        (category.name.as_str(), items)
+                    })
+                    .collect();
+                let uncategorised: Vec<&Item> = self
+                    .items
+                    .iter()
+                    .filter(|item| !self.categories.iter().any(|category| Some(category.id) == item.category_id))
+                    .filter(matches)
+                    .collect();
+                let show_headings = groups.iter().any(|(_, items)| !items.is_empty());
+                groups.push(("Other", uncategorised));
+
+                for (name, items) in groups {
+                    if items.is_empty() {
+                        continue;
+                    }
+                    if show_headings {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(name).small().strong().weak());
+                    }
+                    for item in items {
+                        let selected = Some(item.id) == self.item_id;
+                        let label = egui::Button::selectable(selected, &item.name)
+                            .min_size(egui::vec2(ui.available_width(), crate::touch::TAP_HEIGHT));
+                        if ui.add(label).clicked() {
+                            clicked = Some(item.id);
+                        }
                     }
                 }
             });
         });
+        if add {
+            self.open_item_form(self.new_item(&data_set));
+        }
         if let Some(item_id) = clicked {
             self.item_id = Some(item_id);
             self.change(|_| Ok(()));
@@ -342,7 +432,7 @@ impl PennyApp {
                 if self.items.is_empty() {
                     ui.label("Add the things you buy, like butter or milk.");
                     if ui.button("Add product").clicked() {
-                        self.dialog = Some(Dialog::Item(ItemForm::new(self.new_item(&data_set), false)));
+                        self.open_item_form(self.new_item(&data_set));
                     }
                 } else {
                     ui.label("Pick a product on the left.");
@@ -359,17 +449,17 @@ impl PennyApp {
             ui.weak(format!("sold by {}", item.quantity_type().label().to_lowercase()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !self.sources.is_empty() && ui.button("Add price").clicked() {
+                    // Start on a store that doesn't have a price yet, since that's the likely reason for adding one.
                     let source_id = self
                         .sources
                         .iter()
                         .find(|source| !self.comparison.iter().any(|compared| compared.price.source_id == source.id))
                         .unwrap_or(&self.sources[0])
                         .id;
-                    self.open_price_form(source_id);
+                    self.open_price_form(source_id, None);
                 }
                 if ui.button("Edit product").clicked() {
-                    let has_prices = !self.comparison.is_empty() || self.db.count_prices_for_item(item.id).unwrap_or(0) > 0;
-                    self.dialog = Some(Dialog::Item(ItemForm::new(item.clone(), has_prices)));
+                    self.open_item_form(item.clone());
                 }
             });
         });
@@ -392,13 +482,19 @@ impl PennyApp {
         let mut confirm = None;
         let mut history = None;
 
+        if self.comparison.is_empty() {
+            ui.label("No prices yet. Use Add price when you see it in a store.");
+            return;
+        }
+
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            // One card per store, cheapest first. Everything is visible without hovering, for touch screens.
+            // One card per store and variant, cheapest first. Everything is visible without hovering, for touch screens.
             for compared in &self.comparison {
                 let price = &compared.price;
+                let key = PriceKey { item_id: price.item_id, source_id: price.source_id, variant_id: price.variant_id };
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&compared.source_name).size(21.0).strong());
+                        ui.label(RichText::new(compared.title()).size(21.0).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             judgement_badge(ui, compared.judgement);
                             let unit_price = format_unit_price(currency, compared.adjusted_price_per_base_unit, denominator);
@@ -426,13 +522,13 @@ impl PennyApp {
                     };
                     let mut buttons = |ui: &mut Ui| {
                         if ui.button("New price").clicked() {
-                            open_price = Some(price.source_id);
+                            open_price = Some(key);
                         }
                         if ui.button("Still the same").clicked() {
                             confirm = Some(price.clone());
                         }
                         if ui.button("History").clicked() {
-                            history = Some(price.source_id);
+                            history = Some(key);
                         }
                     };
 
@@ -454,36 +550,16 @@ impl PennyApp {
                 });
             }
 
-            for source in &self.sources {
-                if self.comparison.iter().any(|compared| compared.price.source_id == source.id) {
-                    continue;
-                }
-                card(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&source.name).size(21.0).strong());
-                        ui.weak("No price yet");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Add price").clicked() {
-                                open_price = Some(source.id);
-                            }
-                        });
-                    });
-                });
-            }
-
-            if self.comparison.is_empty() {
-                return;
-            }
             ui.add_space(4.0);
             ui.weak(format!(
-                "Unit prices include loyalty rewards. Prices not seen for over {} days (amber) are adjusted for inflation. \
-                 Prices over {} days old (red) aren't used to rate the others.",
+                "Unit prices include store discounts and surcharges. Prices not seen for over {} days (amber) are \
+                 adjusted for inflation. Prices over {} days old (red) aren't used to rate the others.",
                 self.age_settings.stale_after_days, self.age_settings.ancient_after_days
             ));
         });
 
-        if let Some(source_id) = open_price {
-            self.open_price_form(source_id);
+        if let Some(key) = open_price {
+            self.open_price_form(key.source_id, key.variant_id);
         }
         if let Some(price) = confirm {
             let now = now_millis();
@@ -497,8 +573,8 @@ impl PennyApp {
                 self.notice = Some(Notice { text: "Marked as seen today.".into(), is_error: false, undo_price_id: Some(id) });
             }
         }
-        if let Some(source_id) = history {
-            self.dialog = Some(Dialog::History { item_id: item.id, source_id });
+        if let Some(key) = history {
+            self.dialog = Some(Dialog::History(key));
         }
     }
 
@@ -535,9 +611,12 @@ impl PennyApp {
             Dialog::DataSet(form) => self.data_set_dialog(ctx, form),
             Dialog::Item(form) => self.item_dialog(ctx, form),
             Dialog::Source(form) => self.source_dialog(ctx, form),
+            Dialog::Category(form) => self.category_dialog(ctx, form),
             Dialog::Price(form) => self.price_dialog(ctx, form),
-            Dialog::History { item_id, source_id } => self.history_dialog(ctx, *item_id, *source_id),
+            Dialog::History(key) => self.history_dialog(ctx, *key),
             Dialog::Stores => self.stores_dialog(ctx),
+            Dialog::Categories => self.categories_dialog(ctx),
+            Dialog::Converter(converter) => self.converter_dialog(ctx, converter),
             Dialog::Settings(form) => self.settings_dialog(ctx, form),
             Dialog::Confirm(confirm) => self.confirm_dialog(ctx, confirm),
             Dialog::About => about_dialog(ctx),
@@ -580,13 +659,17 @@ impl PennyApp {
     fn item_dialog(&mut self, ctx: &egui::Context, form: &mut ItemForm) -> bool {
         let Some(data_set) = self.data_set().cloned() else { return false };
         let others = self.items.clone();
-        match modal(ctx, |ui| form.show(ui, &data_set, &others)).0 {
+        let categories = self.categories.clone();
+        match modal(ctx, |ui| form.show(ui, &data_set, &others, &categories)).0 {
             Outcome::Open => true,
             Outcome::Cancel => false,
             Outcome::Save => {
                 let draft = form.draft.clone();
+                let variants = form.variants.clone();
                 self.change(|app| {
-                    app.item_id = Some(app.db.save_item(&draft)?);
+                    let item_id = app.db.save_item(&draft)?;
+                    app.db.replace_variants(item_id, &variants)?;
+                    app.item_id = Some(item_id);
                     Ok(())
                 });
                 false
@@ -647,10 +730,15 @@ impl PennyApp {
         }
     }
 
-    fn history_dialog(&mut self, ctx: &egui::Context, item_id: i64, source_id: i64) -> bool {
+    fn history_dialog(&mut self, ctx: &egui::Context, key: PriceKey) -> bool {
         let (Some(data_set), Some(item)) = (self.data_set().cloned(), self.item().cloned()) else { return false };
-        let source_name = self.sources.iter().find(|source| source.id == source_id).map(|source| source.name.clone()).unwrap_or_default();
-        let entries = match self.db.price_history(item_id, source_id) {
+        let source_name =
+            self.sources.iter().find(|source| source.id == key.source_id).map(|source| source.name.clone()).unwrap_or_default();
+        let product_name = match key.variant_id.and_then(|id| self.variants.iter().find(|variant| variant.id == id)) {
+            Some(variant) => format!("{} ({})", item.name, variant.name),
+            None => item.name.clone(),
+        };
+        let entries = match self.db.price_history(key.item_id, key.source_id, key.variant_id) {
             Ok(entries) => entries,
             Err(_) => return false,
         };
@@ -661,7 +749,7 @@ impl PennyApp {
         let mut close = false;
 
         let (_, should_close) = modal(ctx, |ui| {
-            ui.heading(format!("{} at {}", item.name, source_name));
+            ui.heading(format!("{product_name} at {source_name}"));
             ui.add_space(6.0);
             if entries.is_empty() {
                 ui.label("No prices yet.");
@@ -688,7 +776,7 @@ impl PennyApp {
                     }
                 });
             });
-            ui.weak("Unit prices here are shelf prices, without loyalty rewards.");
+            ui.weak("Unit prices here are shelf prices, without store discounts or surcharges.");
             ui.add_space(8.0);
             ui.separator();
             ui.horizontal(|ui| {
@@ -703,19 +791,19 @@ impl PennyApp {
 
         if let Some(id) = delete {
             self.dialog = Some(Dialog::Confirm(Confirm {
-                question: format!("Delete this {} price?", item.name),
+                question: format!("Delete this {product_name} price?"),
                 detail: None,
                 button: "Delete",
-                action: ConfirmAction::DeletePrice { id, item_id, source_id },
+                action: ConfirmAction::DeletePrice { id, key },
             }));
             return false;
         }
         if delete_all {
             self.dialog = Some(Dialog::Confirm(Confirm {
-                question: format!("Delete every {} price at {}?", item.name, source_name),
+                question: format!("Delete every {product_name} price at {source_name}?"),
                 detail: None,
                 button: "Delete all",
-                action: ConfirmAction::DeletePriceHistory { item_id, source_id },
+                action: ConfirmAction::DeletePriceHistory(key),
             }));
             return false;
         }
@@ -771,6 +859,87 @@ impl PennyApp {
         !(close || should_close)
     }
 
+    fn categories_dialog(&mut self, ctx: &egui::Context) -> bool {
+        let Some(data_set_id) = self.data_set_id else { return false };
+        let mut edit = None;
+        let mut add = false;
+        let mut close = false;
+        let (_, should_close) = modal(ctx, |ui| {
+            ui.heading("Categories");
+            ui.add_space(6.0);
+            if self.categories.is_empty() {
+                ui.label("No categories yet.");
+            }
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                egui::Grid::new("categories").num_columns(3).spacing([16.0, 8.0]).striped(true).show(ui, |ui| {
+                    for category in &self.categories {
+                        ui.label(&category.name);
+                        let count = self.items.iter().filter(|item| item.category_id == Some(category.id)).count();
+                        ui.weak(if count == 1 { "1 product".to_string() } else { format!("{count} products") });
+                        if ui.button("Edit").clicked() {
+                            edit = Some(category.clone());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                add = ui.button("New category").clicked();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = ui.button("Close").clicked();
+                });
+            });
+        });
+        if let Some(category) = edit {
+            self.dialog = Some(Dialog::Category(CategoryForm::new(category)));
+            return false;
+        }
+        if add {
+            let category = Category { id: 0, data_set_id, name: String::new() };
+            self.dialog = Some(Dialog::Category(CategoryForm::new(category)));
+            return false;
+        }
+        !(close || should_close)
+    }
+
+    fn category_dialog(&mut self, ctx: &egui::Context, form: &mut CategoryForm) -> bool {
+        let others = self.categories.clone();
+        match modal(ctx, |ui| form.show(ui, &others)).0 {
+            Outcome::Open => true,
+            Outcome::Cancel => {
+                self.dialog = Some(Dialog::Categories);
+                false
+            }
+            Outcome::Save => {
+                let draft = form.draft.clone();
+                self.change(|app| app.db.save_category(&draft).map(|_| ()));
+                self.dialog = Some(Dialog::Categories);
+                false
+            }
+            Outcome::Delete => {
+                let has_products = self.items.iter().any(|item| item.category_id == Some(form.draft.id));
+                self.dialog = Some(Dialog::Confirm(Confirm {
+                    question: format!("Delete the {} category?", form.draft.name),
+                    detail: has_products.then(|| "Its products stay, without a category.".into()),
+                    button: "Delete",
+                    action: ConfirmAction::DeleteCategory(form.draft.id),
+                }));
+                false
+            }
+        }
+    }
+
+    fn converter_dialog(&mut self, ctx: &egui::Context, converter: &mut Converter) -> bool {
+        let currency = match self.data_set() {
+            Some(data_set) => data_set.currency(),
+            None => crate::money::currency(crate::money::DEFAULT_CURRENCY),
+        };
+        let (close, should_close) = modal(ctx, |ui| converter.show(ui, currency));
+        !(close || should_close)
+    }
+
     fn settings_dialog(&mut self, ctx: &egui::Context, form: &mut SettingsForm) -> bool {
         match modal(ctx, |ui| form.show(ui)).0 {
             (Outcome::Save, Some(settings)) => {
@@ -810,12 +979,16 @@ impl PennyApp {
             ConfirmAction::DeleteDataSet(id) => self.change(|app| app.db.delete_data_set(*id)),
             ConfirmAction::DeleteItem(id) => self.change(|app| app.db.delete_item(*id)),
             ConfirmAction::DeleteSource(id) => self.change(|app| app.db.delete_source(*id)),
-            ConfirmAction::DeletePrice { id, item_id, source_id } => {
-                self.change(|app| app.db.delete_price(*id));
-                self.dialog = Some(Dialog::History { item_id: *item_id, source_id: *source_id });
+            ConfirmAction::DeleteCategory(id) => {
+                self.change(|app| app.db.delete_category(*id));
+                self.dialog = Some(Dialog::Categories);
             }
-            ConfirmAction::DeletePriceHistory { item_id, source_id } => {
-                self.change(|app| app.db.delete_price_history(*item_id, *source_id));
+            ConfirmAction::DeletePrice { id, key } => {
+                self.change(|app| app.db.delete_price(*id));
+                self.dialog = Some(Dialog::History(*key));
+            }
+            ConfirmAction::DeletePriceHistory(key) => {
+                self.change(|app| app.db.delete_price_history(key.item_id, key.source_id, key.variant_id));
             }
             ConfirmAction::Restore(path) => {
                 let path = path.clone();
