@@ -29,7 +29,19 @@ jobs:
 
       - run: cargo build --release
 
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & $iscc "/DAppVersion=$version" installer\penny-pincher.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      # penny-pincher-setup.exe is for new installs; the in-app updater downloads penny-pincher.exe.
       - uses: softprops/action-gh-release@v2
         with:
-          files: target/release/penny-pincher.exe
+          files: |
+            target/installer/penny-pincher-setup.exe
+            target/release/penny-pincher.exe
           generate_release_notes: true

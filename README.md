@@ -11,6 +11,12 @@ Record what something costs at each store you shop at. Penny Pincher works out t
 
 Each price is marked good, OK or bad compared with the other stores. Products are grouped into categories (Essentials, Baking, Home and any you add), and there's a unit converter for amounts and prices per unit. Everything is stored locally in SQLite, and the app works fully offline.
 
+## Installing
+
+Download `penny-pincher-setup.exe` from the [latest release](https://github.com/petmar20/penny-pincher/releases/latest) and run it. It installs for your Windows account only (no admin needed), adds a Start menu shortcut, and can be removed from Settings > Apps.
+
+The installer isn't code-signed yet, so Windows may warn about it. If you see "Windows protected your PC", choose More info > Run anyway. If nothing happens at all, Smart App Control may be blocking it: check Windows Security > App & browser control.
+
 ## Building
 
 Requires Rust (edition 2024) and the Windows SDK (for embedding the icon).
@@ -32,7 +38,9 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The Release workflow builds the exe on Windows, runs the tests, and attaches `penny-pincher.exe` to a new GitHub release.
+The Release workflow builds the exe on Windows, runs the tests, builds the installer with Inno Setup (`installer/penny-pincher.iss`), and attaches both `penny-pincher-setup.exe` and `penny-pincher.exe` to a new GitHub release. The updater uses `penny-pincher.exe`.
+
+If the app can't start, it shows a message and writes details to `%LOCALAPPDATA%\Penny Pincher\penny-pincher.log`.
 
 ## Code layout
 
