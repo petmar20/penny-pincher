@@ -21,6 +21,19 @@ cargo build --release
 
 The app is `target/release/penny-pincher.exe`. Data lives in `%APPDATA%\Penny Pincher\penny-pincher.db`. Set `PENNY_PINCHER_DB` to use a different file. Use File > Back up to save a copy.
 
+## Updates and releases
+
+The app checks GitHub for a newer release when it starts (quietly, so it still works offline) and from Help > Check for updates. Updating downloads the new `penny-pincher.exe` and swaps it in; it takes effect after a restart.
+
+To publish a release, bump `version` in `Cargo.toml`, commit, then tag and push:
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The Release workflow builds the exe on Windows, runs the tests, and attaches `penny-pincher.exe` to a new GitHub release.
+
 ## Code layout
 
 - `src/units.rs`: units of measure and conversion
@@ -29,6 +42,7 @@ The app is `target/release/penny-pincher.exe`. Data lives in `%APPDATA%\Penny Pi
 - `src/analysis.rs`: unit price comparison and good/OK/bad judgements
 - `src/db.rs`: SQLite schema, migrations, backup and restore
 - `src/converter.rs`: the unit converter
+- `src/update.rs`: updating from GitHub releases
 - `src/forms.rs`, `src/app.rs`, `src/touch.rs`: the egui user interface
 
 ## Credits

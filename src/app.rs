@@ -1,6 +1,7 @@
 //! The main window.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::Result;
 use egui::{RichText, Ui};
@@ -14,6 +15,7 @@ use crate::forms::{
 };
 use crate::model::{Category, DataSet, Item, LoyaltyType, Price, Source, Variant, now_millis};
 use crate::units::{self, Unit};
+use crate::update::{self, Release};
 
 pub struct PennyApp {
     db: Db,
@@ -33,6 +35,15 @@ pub struct PennyApp {
     unit_price_denominator: Option<Unit>,
     dialog: Option<Dialog>,
     notice: Option<Notice>,
+    /// Background update checks and downloads report back on this channel.
+    update_events: (Sender<UpdateEvent>, Receiver<UpdateEvent>),
+    available_update: Option<Release>,
+    checked_for_update_at_start: bool,
+}
+
+enum UpdateEvent {
+    Checked { result: Result<Option<Release>>, asked: bool },
+    Installed { version: String, result: Result<()> },
 }
 
 enum Dialog {
@@ -73,10 +84,18 @@ enum ConfirmAction {
     Restore(PathBuf),
 }
 
+/// A message in the status bar, with an optional button.
 struct Notice {
     text: String,
     is_error: bool,
-    undo_price_id: Option<i64>,
+    action: Option<NoticeAction>,
+}
+
+#[derive(Clone, Copy)]
+enum NoticeAction {
+    UndoPrice(i64),
+    InstallUpdate,
+    Restart,
 }
 
 impl PennyApp {
@@ -99,6 +118,9 @@ impl PennyApp {
             unit_price_denominator: None,
             dialog: None,
             notice: None,
+            update_events: mpsc::channel(),
+            available_update: None,
+            checked_for_update_at_start: false,
         };
         app.reload()?;
         Ok(app)
@@ -146,12 +168,20 @@ impl PennyApp {
     fn change(&mut self, action: impl FnOnce(&mut Self) -> Result<()>) {
         let result = action(self).and_then(|()| self.reload());
         if let Err(error) = result {
-            self.notice = Some(Notice { text: format!("{error:#}"), is_error: true, undo_price_id: None });
+            self.report_error(error);
         }
     }
 
     fn say(&mut self, text: impl Into<String>) {
-        self.notice = Some(Notice { text: text.into(), is_error: false, undo_price_id: None });
+        self.notice = Some(Notice { text: text.into(), is_error: false, action: None });
+    }
+
+    fn notify(&mut self, text: impl Into<String>, action: NoticeAction) {
+        self.notice = Some(Notice { text: text.into(), is_error: false, action: Some(action) });
+    }
+
+    fn report_error(&mut self, error: anyhow::Error) {
+        self.notice = Some(Notice { text: format!("{error:#}"), is_error: true, action: None });
     }
 
     fn price_context(&self) -> Option<PriceContext<'_>> {
@@ -186,7 +216,7 @@ impl PennyApp {
     fn open_item_form(&mut self, item: Item) {
         match self.item_form(item) {
             Ok(form) => self.dialog = Some(Dialog::Item(form)),
-            Err(error) => self.notice = Some(Notice { text: format!("{error:#}"), is_error: true, undo_price_id: None }),
+            Err(error) => self.report_error(error),
         }
     }
 
@@ -268,6 +298,10 @@ impl PennyApp {
                     self.dialog = Some(Dialog::Converter(Converter::default()));
                 }
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Check for updates").clicked() {
+                        ui.close();
+                        self.check_for_update(ui.ctx(), true);
+                    }
                     if ui.button("About Penny Pincher").clicked() {
                         ui.close();
                         self.dialog = Some(Dialog::About);
@@ -279,7 +313,7 @@ impl PennyApp {
 
     fn status_bar(&mut self, ui: &mut Ui) {
         let Some(notice) = &self.notice else { return };
-        let mut undo = None;
+        let mut clicked = None;
         let mut dismiss = false;
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -288,10 +322,15 @@ impl PennyApp {
                 } else {
                     ui.label(&notice.text);
                 }
-                if let Some(id) = notice.undo_price_id
-                    && ui.button("Undo").clicked()
-                {
-                    undo = Some(id);
+                if let Some(action) = notice.action {
+                    let label = match action {
+                        NoticeAction::UndoPrice(_) => "Undo",
+                        NoticeAction::InstallUpdate => "Update",
+                        NoticeAction::Restart => "Restart",
+                    };
+                    if ui.button(label).clicked() {
+                        clicked = Some(action);
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     dismiss = ui.button("✕").clicked();
@@ -301,9 +340,64 @@ impl PennyApp {
         if dismiss {
             self.notice = None;
         }
-        if let Some(id) = undo {
-            self.change(|app| app.db.delete_price(id));
-            self.say("Undone.");
+        match clicked {
+            None => {}
+            Some(NoticeAction::UndoPrice(id)) => {
+                self.change(|app| app.db.delete_price(id));
+                self.say("Undone.");
+            }
+            Some(NoticeAction::InstallUpdate) => self.install_update(ui.ctx()),
+            Some(NoticeAction::Restart) => match update::restart() {
+                Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(error) => self.report_error(error.context("Couldn't restart")),
+            },
+        }
+    }
+
+    // Updates
+
+    fn check_for_update(&mut self, ctx: &egui::Context, asked: bool) {
+        if asked {
+            self.say("Checking for updates…");
+        }
+        let events = self.update_events.0.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = events.send(UpdateEvent::Checked { result: update::check_for_update(), asked });
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context) {
+        let Some(release) = self.available_update.take() else { return };
+        self.say(format!("Downloading version {}…", release.version));
+        let events = self.update_events.0.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::install(&release);
+            let _ = events.send(UpdateEvent::Installed { version: release.version, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn handle_update_events(&mut self) {
+        while let Ok(event) = self.update_events.1.try_recv() {
+            match event {
+                UpdateEvent::Checked { result: Ok(Some(release)), .. } => {
+                    self.notify(format!("Version {} is available.", release.version), NoticeAction::InstallUpdate);
+                    self.available_update = Some(release);
+                }
+                UpdateEvent::Checked { result: Ok(None), asked: true } => self.say("You have the latest version."),
+                UpdateEvent::Checked { result: Err(error), asked: true } => {
+                    self.report_error(error.context("Couldn't check for updates"));
+                }
+                // The automatic check stays quiet when there's nothing new or no internet.
+                UpdateEvent::Checked { asked: false, .. } => {}
+                UpdateEvent::Installed { version, result: Ok(()) } => {
+                    self.notify(format!("Updated to version {version}. Restart to use it."), NoticeAction::Restart);
+                }
+                UpdateEvent::Installed { result: Err(error), .. } => self.report_error(error),
+            }
         }
     }
 
@@ -517,7 +611,7 @@ impl PennyApp {
                 Ok(())
             });
             if let Some(id) = new_id {
-                self.notice = Some(Notice { text: "Marked as seen today.".into(), is_error: false, undo_price_id: Some(id) });
+                self.notify("Marked as seen today.", NoticeAction::UndoPrice(id));
             }
         }
         if let Some(key) = history {
@@ -534,7 +628,7 @@ impl PennyApp {
         };
         match self.db.back_up_to(&path) {
             Ok(()) => self.say(format!("Backed up to {}.", path.display())),
-            Err(error) => self.notice = Some(Notice { text: format!("{error:#}"), is_error: true, undo_price_id: None }),
+            Err(error) => self.report_error(error),
         }
     }
 
@@ -638,7 +732,7 @@ impl PennyApp {
                     Ok(())
                 });
                 if let Some(id) = new_id {
-                    self.notice = Some(Notice { text: "Price saved.".into(), is_error: false, undo_price_id: Some(id) });
+                    self.notify("Price saved.", NoticeAction::UndoPrice(id));
                 }
                 false
             }
@@ -921,6 +1015,11 @@ impl PennyApp {
 
 impl eframe::App for PennyApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        if !self.checked_for_update_at_start {
+            self.checked_for_update_at_start = true;
+            self.check_for_update(ui.ctx(), false);
+        }
+        self.handle_update_events();
         self.menu_bar(ui);
         self.status_bar(ui);
         self.products_panel(ui);

@@ -1,0 +1,35 @@
+# Pushing a tag like v0.2.0 builds the Windows app and publishes it as a GitHub release.
+# The app's updater downloads penny-pincher.exe from the latest release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches the version in Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match Cargo.toml version $version"
+          }
+
+      - run: cargo test --release
+
+      - run: cargo build --release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/penny-pincher.exe
+          generate_release_notes: true

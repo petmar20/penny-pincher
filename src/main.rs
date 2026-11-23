@@ -10,6 +10,7 @@ mod model;
 mod money;
 mod touch;
 mod units;
+mod update;
 
 fn main() {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("the icon is a valid PNG");
