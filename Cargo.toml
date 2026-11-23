@@ -1,0 +1,18 @@
+[package]
+name = "penny-pincher"
+version = "0.1.0"
+edition = "2024"
+description = "Track grocery prices across stores and find the best deal."
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.105"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+dirs = "7.0.0"
+eframe = "0.37.0"
+egui = "0.37.0"
+rfd = "0.18.0"
+rusqlite = { version = "0.43.0", features = ["bundled", "backup"] }
+
+[build-dependencies]
+winresource = "0.1.34"
