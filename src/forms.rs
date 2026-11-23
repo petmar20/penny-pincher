@@ -50,11 +50,11 @@ pub fn error_color(ui: &Ui) -> Color32 {
 }
 
 fn name_field(ui: &mut Ui, name: &mut String) {
-    ui.add(egui::TextEdit::singleline(name).char_limit(NAME_LIMIT).desired_width(260.0));
+    ui.add(egui::TextEdit::singleline(name).char_limit(NAME_LIMIT).desired_width(320.0));
 }
 
 fn notes_field(ui: &mut Ui, notes: &mut String) {
-    ui.add(egui::TextEdit::multiline(notes).char_limit(NOTES_LIMIT).desired_rows(2).desired_width(260.0));
+    ui.add(egui::TextEdit::multiline(notes).char_limit(NOTES_LIMIT).desired_rows(2).desired_width(320.0));
 }
 
 fn is_name_taken<'a>(name: &str, id: i64, others: impl IntoIterator<Item = (i64, &'a str)>) -> bool {
@@ -160,19 +160,22 @@ impl ItemForm {
             ui.end_row();
 
             ui.label("Sold by");
-            ui.add_enabled_ui(!self.has_prices, |ui| {
-                ui.horizontal(|ui| {
-                    let mut quantity_type = self.draft.quantity_type();
-                    for option in QuantityType::ALL {
-                        ui.radio_value(&mut quantity_type, option, option.label());
-                    }
-                    if quantity_type != self.draft.quantity_type() {
-                        self.draft.default_unit = data_set.units_for(quantity_type, false)[0];
-                    }
+            ui.vertical(|ui| {
+                ui.add_enabled_ui(!self.has_prices, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut quantity_type = self.draft.quantity_type();
+                        for option in QuantityType::ALL {
+                            ui.radio_value(&mut quantity_type, option, option.label());
+                        }
+                        if quantity_type != self.draft.quantity_type() {
+                            self.draft.default_unit = data_set.units_for(quantity_type, false)[0];
+                        }
+                    });
                 });
-            })
-            .response
-            .on_disabled_hover_text("This can't change once the product has prices.");
+                if self.has_prices {
+                    ui.weak("Can't change once the product has prices.");
+                }
+            });
             ui.end_row();
 
             ui.label("Usual unit");
@@ -254,9 +257,9 @@ impl SourceForm {
             ui.label("Loyalty scheme");
             ui.vertical(|ui| {
                 for option in LoyaltyType::ALL {
-                    let label = ui.radio_value(&mut self.draft.loyalty_type, option, option.label());
+                    ui.radio_value(&mut self.draft.loyalty_type, option, option.label());
                     if !option.hint().is_empty() {
-                        label.on_hover_text(option.hint());
+                        ui.weak(option.hint());
                     }
                 }
             });
@@ -423,7 +426,7 @@ impl PriceForm {
             ui.end_row();
 
             ui.label("Price");
-            let price_field = ui.add(egui::TextEdit::singleline(&mut self.price).desired_width(90.0).char_limit(12).hint_text(currency.symbol.trim()));
+            let price_field = ui.add(egui::TextEdit::singleline(&mut self.price).desired_width(120.0).char_limit(12).hint_text(currency.symbol.trim()));
             if ui.memory(|memory| memory.focused().is_none()) {
                 price_field.request_focus();
             }
@@ -431,14 +434,14 @@ impl PriceForm {
 
             if context.item.allow_multipack {
                 ui.label("Packs");
-                ui.add(egui::TextEdit::singleline(&mut self.count).desired_width(90.0).char_limit(6).hint_text("1"));
+                ui.add(egui::TextEdit::singleline(&mut self.count).desired_width(120.0).char_limit(6).hint_text("1"));
                 ui.end_row();
             }
 
             ui.label(if context.item.allow_multipack { "Size of each" } else { "Size" });
             ui.horizontal(|ui| {
                 let hint = if context.item.quantity_type() == QuantityType::Item { "1" } else { "" };
-                ui.add(egui::TextEdit::singleline(&mut self.size).desired_width(90.0).char_limit(12).hint_text(hint));
+                ui.add(egui::TextEdit::singleline(&mut self.size).desired_width(120.0).char_limit(12).hint_text(hint));
                 unit_picker(ui, "price_unit", context.data_set, context.item.quantity_type(), &mut self.unit);
             });
             ui.end_row();
@@ -571,22 +574,18 @@ impl SettingsForm {
     pub fn show(&mut self, ui: &mut Ui) -> (Outcome, Option<AgeSettings>) {
         ui.heading("Settings");
         ui.add_space(6.0);
-        egui::Grid::new("settings_form").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Old prices").on_hover_text("Prices you haven't seen for this long get an inflation adjustment.");
-            ui.add(egui::TextEdit::singleline(&mut self.stale).desired_width(60.0).char_limit(4));
-            ui.label("days");
-            ui.end_row();
-
-            ui.label("Very old prices").on_hover_text("Prices this old aren't used to decide what counts as a good price.");
-            ui.add(egui::TextEdit::singleline(&mut self.ancient).desired_width(60.0).char_limit(4));
-            ui.label("days");
-            ui.end_row();
-
-            ui.label("Inflation").on_hover_text("How much old prices go up each year.");
-            ui.add(egui::TextEdit::singleline(&mut self.inflation).desired_width(60.0).char_limit(6));
-            ui.label("% a year");
-            ui.end_row();
-        });
+        let setting = |ui: &mut Ui, label: &str, hint: &str, value: &mut String, suffix: &str| {
+            ui.label(RichText::new(label).strong());
+            ui.weak(hint);
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(value).desired_width(80.0).char_limit(6));
+                ui.label(suffix);
+            });
+            ui.add_space(6.0);
+        };
+        setting(ui, "Old prices", "Prices you haven't seen for this long get an inflation adjustment.", &mut self.stale, "days");
+        setting(ui, "Very old prices", "Prices this old aren't used to rate the others.", &mut self.ancient, "days");
+        setting(ui, "Inflation", "How much old prices go up each year.", &mut self.inflation, "% a year");
         error_text(ui, &self.error);
 
         match buttons(ui, false, "") {

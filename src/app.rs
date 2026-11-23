@@ -283,7 +283,7 @@ impl PennyApp {
                     undo = Some(id);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    dismiss = ui.small_button("✕").clicked();
+                    dismiss = ui.button("✕").clicked();
                 });
             });
         });
@@ -315,7 +315,8 @@ impl PennyApp {
                 let search = self.search.trim().to_lowercase();
                 for item in self.items.iter().filter(|item| item.name.to_lowercase().contains(&search)) {
                     let selected = Some(item.id) == self.item_id;
-                    let label = egui::Button::selectable(selected, &item.name).min_size(egui::vec2(ui.available_width(), 0.0));
+                    let label = egui::Button::selectable(selected, &item.name)
+                        .min_size(egui::vec2(ui.available_width(), crate::touch::TAP_HEIGHT));
                     if ui.add(label).clicked() {
                         clicked = Some(item.id);
                     }
@@ -392,70 +393,93 @@ impl PennyApp {
         let mut history = None;
 
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("comparison").num_columns(6).spacing([18.0, 10.0]).striped(true).show(ui, |ui| {
-                for header in ["Store", "Shelf price", "Unit price", "Last seen", "", ""] {
-                    ui.label(RichText::new(header).strong());
-                }
-                ui.end_row();
-
-                for compared in &self.comparison {
-                    let price = &compared.price;
-                    let store = ui.label(&compared.source_name);
-                    if let Some(source) = self.sources.iter().find(|source| source.id == price.source_id)
-                        && source.loyalty_type != LoyaltyType::None
-                    {
-                        let percent = source.loyalty_type.percent_from_multiplier(source.loyalty_multiplier);
-                        store.on_hover_text(format!("{}: {}%", source.loyalty_type.label(), units::format_number(percent, 2)));
-                    }
-
-                    let shelf = ui.label(price.describe(currency));
-                    if !price.notes.is_empty() {
-                        shelf.on_hover_text(&price.notes);
-                    }
-
-                    let unit_price = ui.label(RichText::new(format_unit_price(currency, compared.adjusted_price_per_base_unit, denominator)).strong());
-                    if compared.is_adjusted() {
-                        let shelf_unit_price = format_unit_price(currency, price.price_per_base_unit(price.price), denominator);
-                        unit_price.on_hover_text(format!("{shelf_unit_price} at the shelf price, adjusted for loyalty rewards and age."));
-                    }
-
-                    age_label(ui, compared, &self.age_settings);
-                    judgement_badge(ui, compared.judgement);
-
+            // One card per store, cheapest first. Everything is visible without hovering, for touch screens.
+            for compared in &self.comparison {
+                let price = &compared.price;
+                card(ui, |ui| {
                     ui.horizontal(|ui| {
+                        ui.label(RichText::new(&compared.source_name).size(21.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            judgement_badge(ui, compared.judgement);
+                            let unit_price = format_unit_price(currency, compared.adjusted_price_per_base_unit, denominator);
+                            ui.label(RichText::new(unit_price).size(21.0).strong());
+                        });
+                    });
+                    let details = |ui: &mut Ui| {
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        ui.label(price.describe(currency));
+                        ui.weak("·");
+                        age_label(ui, compared);
+                        if compared.is_adjusted() {
+                            let shelf_unit_price = format_unit_price(currency, price.price_per_base_unit(price.price), denominator);
+                            ui.weak(format!("· {shelf_unit_price} before adjustments"));
+                        }
+                        if let Some(source) = self.sources.iter().find(|source| source.id == price.source_id)
+                            && source.loyalty_type != LoyaltyType::None
+                        {
+                            let percent = source.loyalty_type.percent_from_multiplier(source.loyalty_multiplier);
+                            ui.weak(format!("· {} {}%", source.loyalty_type.label(), units::format_number(percent, 2)));
+                        }
+                        if !price.notes.is_empty() {
+                            ui.weak(format!("· {}", price.notes));
+                        }
+                    };
+                    let mut buttons = |ui: &mut Ui| {
                         if ui.button("New price").clicked() {
                             open_price = Some(price.source_id);
                         }
-                        if ui.button("Still the same").on_hover_text("You saw this price today").clicked() {
+                        if ui.button("Still the same").clicked() {
                             confirm = Some(price.clone());
                         }
                         if ui.button("History").clicked() {
                             history = Some(price.source_id);
                         }
-                    });
-                    ui.end_row();
-                }
+                    };
 
-                for source in &self.sources {
-                    if self.comparison.iter().any(|compared| compared.price.source_id == source.id) {
-                        continue;
+                    // Details beside the buttons when there's room, otherwise above them.
+                    const BUTTONS_WIDTH: f32 = 380.0;
+                    let details_width = ui.available_width() - BUTTONS_WIDTH;
+                    let wrapping = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+                    if details_width >= 300.0 {
+                        ui.horizontal(|ui| {
+                            ui.allocate_ui_with_layout(egui::vec2(details_width, 0.0), wrapping, details);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.horizontal(|ui| buttons(ui));
+                            });
+                        });
+                    } else {
+                        ui.with_layout(wrapping, details);
+                        ui.horizontal(|ui| buttons(ui));
                     }
-                    ui.label(&source.name);
-                    ui.weak("No price yet");
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
-                    if ui.button("Add price").clicked() {
-                        open_price = Some(source.id);
-                    }
-                    ui.end_row();
-                }
-            });
-
-            if self.comparison.iter().any(ComparedPrice::is_adjusted) {
-                ui.add_space(8.0);
-                ui.weak("Unit prices include loyalty rewards, and old prices are adjusted for inflation.");
+                });
             }
+
+            for source in &self.sources {
+                if self.comparison.iter().any(|compared| compared.price.source_id == source.id) {
+                    continue;
+                }
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&source.name).size(21.0).strong());
+                        ui.weak("No price yet");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Add price").clicked() {
+                                open_price = Some(source.id);
+                            }
+                        });
+                    });
+                });
+            }
+
+            if self.comparison.is_empty() {
+                return;
+            }
+            ui.add_space(4.0);
+            ui.weak(format!(
+                "Unit prices include loyalty rewards. Prices not seen for over {} days (amber) are adjusted for inflation. \
+                 Prices over {} days old (red) aren't used to rate the others.",
+                self.age_settings.stale_after_days, self.age_settings.ancient_after_days
+            ));
         });
 
         if let Some(source_id) = open_price {
@@ -657,7 +681,7 @@ impl PennyApp {
                         ui.label(format_unit_price(currency, entry.price_per_base_unit(entry.price), denominator));
                         ui.label(&entry.notes);
                         let hint = if index == 0 { "Delete this price. The one below becomes current." } else { "Delete this price" };
-                        if ui.small_button("Delete").on_hover_text(hint).clicked() {
+                        if ui.button("Delete").on_hover_text(hint).clicked() {
                             delete = Some(entry.id);
                         }
                         ui.end_row();
@@ -720,7 +744,7 @@ impl PennyApp {
                                 ui.weak(format!("{} {}%", loyalty_type.label(), units::format_number(percent, 2)))
                             }
                         };
-                        if ui.small_button("Edit").clicked() {
+                        if ui.button("Edit").clicked() {
                             edit = Some(source.clone());
                         }
                         ui.end_row();
@@ -823,7 +847,7 @@ impl eframe::App for PennyApp {
 /// Shows a dialog over the window. The bool is true when the user clicked outside it or pressed Escape.
 fn modal<R>(ctx: &egui::Context, content: impl FnOnce(&mut Ui) -> R) -> (R, bool) {
     let response = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
-        ui.set_min_width(380.0);
+        ui.set_min_width(460.0);
         content(ui)
     });
     let should_close = response.should_close();
@@ -850,24 +874,26 @@ fn about_dialog(ctx: &egui::Context) -> bool {
     !(close || should_close)
 }
 
-fn age_label(ui: &mut Ui, compared: &ComparedPrice, settings: &AgeSettings) {
-    let text = describe_age(compared.age_days);
+fn card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
+    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        content(ui);
+    });
+    ui.add_space(4.0);
+}
+
+fn age_label(ui: &mut Ui, compared: &ComparedPrice) {
+    let text = format!("seen {}", describe_age(compared.age_days));
     match compared.age_class {
         AgeClass::Fresh => {
             ui.label(text);
         }
         AgeClass::Stale => {
             let color = if ui.visuals().dark_mode { egui::Color32::from_rgb(230, 190, 90) } else { egui::Color32::from_rgb(150, 100, 0) };
-            ui.colored_label(color, text).on_hover_text(format!(
-                "Seen more than {} days ago, so it's adjusted for inflation.",
-                settings.stale_after_days
-            ));
+            ui.colored_label(color, text);
         }
         AgeClass::Ancient => {
-            ui.colored_label(forms::error_color(ui), text).on_hover_text(format!(
-                "Seen more than {} days ago. Check it next time you're there.",
-                settings.ancient_after_days
-            ));
+            ui.colored_label(forms::error_color(ui), text);
         }
     }
 }

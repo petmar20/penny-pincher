@@ -7,6 +7,7 @@ mod db;
 mod forms;
 mod model;
 mod money;
+mod touch;
 mod units;
 
 fn main() {
@@ -14,7 +15,7 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Penny Pincher")
-            .with_inner_size([1040.0, 680.0])
+            .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([720.0, 440.0])
             .with_icon(icon),
         ..Default::default()
@@ -23,7 +24,10 @@ fn main() {
     let result = eframe::run_native(
         "Penny Pincher",
         options,
-        Box::new(|_creation_context| Ok(Box::new(app::PennyApp::new()?))),
+        Box::new(|creation_context| {
+            touch::apply(&creation_context.egui_ctx);
+            Ok(Box::new(app::PennyApp::new()?))
+        }),
     );
     if let Err(error) = result {
         rfd::MessageDialog::new()
