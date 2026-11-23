@@ -20,7 +20,7 @@ fn main() {
     }));
 
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("the icon is a valid PNG");
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Penny Pincher")
             .with_inner_size([1100.0, 760.0])
@@ -28,6 +28,7 @@ fn main() {
             .with_icon(icon),
         ..Default::default()
     };
+    use_direct_x_only(&mut options);
 
     let result = eframe::run_native(
         "Penny Pincher",
@@ -39,6 +40,15 @@ fn main() {
     );
     if let Err(error) = result {
         report_failure("Penny Pincher couldn't start.", &error.to_string(), &format!("{error:?}"));
+    }
+}
+
+/// Draws with DirectX 12 only. Intel's Vulkan driver (igvk64.dll) crashes on some tablets, and
+/// loading it at all is enough. `WGPU_BACKEND` (e.g. `vulkan`) still overrides this.
+fn use_direct_x_only(options: &mut eframe::NativeOptions) {
+    use eframe::egui_wgpu::{WgpuSetup, wgpu};
+    if let WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
     }
 }
 

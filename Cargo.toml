@@ -1,6 +1,6 @@
 [package]
 name = "penny-pincher"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Track grocery prices across stores and find the best deal."
 license = "MIT"
