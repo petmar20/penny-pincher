@@ -9,7 +9,7 @@ use crate::analysis::{self, AgeClass, AgeSettings, ComparedPrice, Thresholds};
 use crate::converter::Converter;
 use crate::db::{self, Db};
 use crate::forms::{
-    self, CategoryForm, DataSetForm, ItemForm, Outcome, PriceContext, PriceForm, SettingsForm, SourceForm,
+    self, CategoryForm, ItemForm, Outcome, PriceContext, PriceForm, SettingsForm, SourceForm,
     format_unit_price, judgement_badge,
 };
 use crate::model::{Category, DataSet, Item, LoyaltyType, Price, Source, Variant, now_millis};
@@ -18,8 +18,8 @@ use crate::units::{self, Unit};
 pub struct PennyApp {
     db: Db,
     age_settings: AgeSettings,
-    data_sets: Vec<DataSet>,
-    data_set_id: Option<i64>,
+    /// Currency and units.
+    data_set: DataSet,
     categories: Vec<Category>,
     items: Vec<Item>,
     sources: Vec<Source>,
@@ -36,7 +36,6 @@ pub struct PennyApp {
 }
 
 enum Dialog {
-    DataSet(DataSetForm),
     Item(ItemForm),
     Source(SourceForm),
     Category(CategoryForm),
@@ -66,7 +65,6 @@ struct Confirm {
 }
 
 enum ConfirmAction {
-    DeleteDataSet(i64),
     DeleteItem(i64),
     DeleteSource(i64),
     DeleteCategory(i64),
@@ -84,20 +82,12 @@ struct Notice {
 impl PennyApp {
     pub fn new() -> Result<Self> {
         let db = Db::open(&db::default_path())?;
-        if db.data_sets()?.is_empty() {
-            let mut groceries = DataSet::new_default();
-            groceries.name = "Groceries".into();
-            db.save_data_set(&groceries)?;
-        }
-        let saved_id = |key: &str| -> Result<Option<i64>> { Ok(db.setting(key)?.and_then(|value| value.parse().ok())) };
-        let data_set_id = saved_id("data_set_id")?;
-        let item_id = saved_id("item_id")?;
+        let item_id = db.setting("item_id")?.and_then(|value| value.parse().ok());
 
         let mut app = PennyApp {
             age_settings: db.age_settings()?,
+            data_set: db.data_set()?,
             db,
-            data_sets: Vec::new(),
-            data_set_id,
             categories: Vec::new(),
             items: Vec::new(),
             sources: Vec::new(),
@@ -116,19 +106,12 @@ impl PennyApp {
 
     /// Re-reads everything shown on screen. The data is small enough that this is instant.
     fn reload(&mut self) -> Result<()> {
-        self.data_sets = self.db.data_sets()?;
-        if !self.data_sets.iter().any(|data_set| Some(data_set.id) == self.data_set_id) {
-            self.data_set_id = self.data_sets.first().map(|data_set| data_set.id);
-        }
-
-        self.categories.clear();
-        self.items.clear();
-        self.sources.clear();
-        if let Some(data_set_id) = self.data_set_id {
-            self.categories = self.db.categories(data_set_id)?;
-            self.items = self.db.items(data_set_id)?;
-            self.sources = self.db.sources(data_set_id)?;
-        }
+        // A restored backup may have a different settings row.
+        self.data_set = self.db.data_set()?;
+        let data_set_id = self.data_set.id;
+        self.categories = self.db.categories(data_set_id)?;
+        self.items = self.db.items(data_set_id)?;
+        self.sources = self.db.sources(data_set_id)?;
         if !self.items.iter().any(|item| Some(item.id) == self.item_id) {
             self.item_id = None;
         }
@@ -137,7 +120,8 @@ impl PennyApp {
         self.comparison.clear();
         self.thresholds = None;
         self.unit_price_denominator = None;
-        if let (Some(item), Some(data_set)) = (self.item().cloned(), self.data_set().cloned()) {
+        if let Some(item) = self.item().cloned() {
+            let data_set = &self.data_set;
             self.variants = self.db.variants(item.id)?;
             let prices = self.db.current_prices(item.id)?;
             let (comparison, thresholds) =
@@ -149,14 +133,9 @@ impl PennyApp {
             self.thresholds = thresholds;
         }
 
-        let id_text = |id: Option<i64>| id.map(|id| id.to_string()).unwrap_or_default();
-        self.db.set_setting("data_set_id", &id_text(self.data_set_id))?;
-        self.db.set_setting("item_id", &id_text(self.item_id))?;
+        let item_id = self.item_id.map(|id| id.to_string()).unwrap_or_default();
+        self.db.set_setting("item_id", &item_id)?;
         Ok(())
-    }
-
-    fn data_set(&self) -> Option<&DataSet> {
-        self.data_sets.iter().find(|data_set| Some(data_set.id) == self.data_set_id)
     }
 
     fn item(&self) -> Option<&Item> {
@@ -177,7 +156,7 @@ impl PennyApp {
 
     fn price_context(&self) -> Option<PriceContext<'_>> {
         Some(PriceContext {
-            data_set: self.data_set()?,
+            data_set: &self.data_set,
             item: self.item()?,
             sources: &self.sources,
             variants: &self.variants,
@@ -192,12 +171,12 @@ impl PennyApp {
         }
     }
 
-    fn new_item(&self, data_set: &DataSet) -> Item {
+    fn new_item(&self) -> Item {
         Item {
             id: 0,
-            data_set_id: data_set.id,
+            data_set_id: self.data_set.id,
             name: String::new(),
-            default_unit: data_set.units_for(units::QuantityType::Weight, false)[0],
+            default_unit: self.data_set.units_for(units::QuantityType::Weight, false)[0],
             allow_multipack: false,
             notes: String::new(),
             category_id: None,
@@ -226,15 +205,19 @@ impl PennyApp {
         Ok(ItemForm::new(item, has_prices, variants, variants_with_prices))
     }
 
-    fn new_source(&self, data_set_id: i64) -> Source {
+    fn new_source(&self) -> Source {
         Source {
             id: 0,
-            data_set_id,
+            data_set_id: self.data_set.id,
             name: String::new(),
             loyalty_type: LoyaltyType::None,
             loyalty_multiplier: 1.0,
             notes: String::new(),
         }
+    }
+
+    fn new_category(&self) -> Category {
+        Category { id: 0, data_set_id: self.data_set.id, name: String::new() }
     }
 
     // Layout
@@ -254,27 +237,21 @@ impl PennyApp {
                     ui.separator();
                     if ui.button("Settings…").clicked() {
                         ui.close();
-                        self.dialog = Some(Dialog::Settings(SettingsForm::new(&self.age_settings)));
+                        self.dialog = Some(Dialog::Settings(SettingsForm::new(&self.data_set, &self.age_settings)));
                     }
                     ui.separator();
                     if ui.button("Exit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                ui.menu_button("Collection", |ui| {
-                    if ui.button("New collection…").clicked() {
-                        ui.close();
-                        self.dialog = Some(Dialog::DataSet(DataSetForm::new(DataSet::new_default())));
-                    }
-                    if let Some(data_set) = self.data_set().cloned()
-                        && ui.button("Edit collection…").clicked()
-                    {
-                        ui.close();
-                        self.dialog = Some(Dialog::DataSet(DataSetForm::new(data_set)));
-                    }
-                    if self.data_set_id.is_some() && ui.button("Categories…").clicked() {
+                ui.menu_button("Categories", |ui| {
+                    if ui.button("Manage categories…").clicked() {
                         ui.close();
                         self.dialog = Some(Dialog::Categories);
+                    }
+                    if ui.button("New category…").clicked() {
+                        ui.close();
+                        self.dialog = Some(Dialog::Category(CategoryForm::new(self.new_category())));
                     }
                 });
                 ui.menu_button("Stores", |ui| {
@@ -282,43 +259,20 @@ impl PennyApp {
                         ui.close();
                         self.dialog = Some(Dialog::Stores);
                     }
-                    if let Some(data_set_id) = self.data_set_id
-                        && ui.button("New store…").clicked()
-                    {
+                    if ui.button("New store…").clicked() {
                         ui.close();
-                        self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source(data_set_id))));
+                        self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source())));
                     }
                 });
-                ui.menu_button("Tools", |ui| {
-                    if ui.button("Unit converter…").clicked() {
-                        ui.close();
-                        self.dialog = Some(Dialog::Converter(Converter::default()));
-                    }
-                });
+                if ui.button("Unit converter").clicked() {
+                    self.dialog = Some(Dialog::Converter(Converter::default()));
+                }
                 ui.menu_button("Help", |ui| {
                     if ui.button("About Penny Pincher").clicked() {
                         ui.close();
                         self.dialog = Some(Dialog::About);
                     }
                 });
-
-                ui.separator();
-                if self.data_sets.len() > 1 {
-                    let mut selected = self.data_set_id;
-                    let name = self.data_set().map(|data_set| data_set.name.clone()).unwrap_or_default();
-                    egui::ComboBox::from_id_salt("data_set").selected_text(name).show_ui(ui, |ui| {
-                        for data_set in &self.data_sets {
-                            ui.selectable_value(&mut selected, Some(data_set.id), &data_set.name);
-                        }
-                    });
-                    if selected != self.data_set_id {
-                        self.data_set_id = selected;
-                        self.item_id = None;
-                        self.change(|_| Ok(()));
-                    }
-                } else if let Some(data_set) = self.data_set() {
-                    ui.label(RichText::new(&data_set.name).strong());
-                }
             });
         });
     }
@@ -354,7 +308,6 @@ impl PennyApp {
     }
 
     fn products_panel(&mut self, ui: &mut Ui) {
-        let Some(data_set) = self.data_set().cloned() else { return };
         let mut clicked = None;
         let mut add = false;
         egui::Panel::left("products").resizable(true).default_size(240.0).show(ui, |ui| {
@@ -411,7 +364,7 @@ impl PennyApp {
             });
         });
         if add {
-            self.open_item_form(self.new_item(&data_set));
+            self.open_item_form(self.new_item());
         }
         if let Some(item_id) = clicked {
             self.item_id = Some(item_id);
@@ -421,18 +374,12 @@ impl PennyApp {
 
     fn central_panel(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            let Some(data_set) = self.data_set().cloned() else {
-                ui.label("Add a collection to get started.");
-                if ui.button("New collection").clicked() {
-                    self.dialog = Some(Dialog::DataSet(DataSetForm::new(DataSet::new_default())));
-                }
-                return;
-            };
+            let data_set = self.data_set.clone();
             let Some(item) = self.item().cloned() else {
                 if self.items.is_empty() {
                     ui.label("Add the things you buy, like butter or milk.");
                     if ui.button("Add product").clicked() {
-                        self.open_item_form(self.new_item(&data_set));
+                        self.open_item_form(self.new_item());
                     }
                 } else {
                     ui.label("Pick a product on the left.");
@@ -471,7 +418,7 @@ impl PennyApp {
         if self.sources.is_empty() {
             ui.label("Add the stores you shop at.");
             if ui.button("Add store").clicked() {
-                self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source(data_set.id))));
+                self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source())));
             }
             return;
         }
@@ -608,7 +555,6 @@ impl PennyApp {
     fn show_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.dialog.take() else { return };
         let keep_open = match &mut dialog {
-            Dialog::DataSet(form) => self.data_set_dialog(ctx, form),
             Dialog::Item(form) => self.item_dialog(ctx, form),
             Dialog::Source(form) => self.source_dialog(ctx, form),
             Dialog::Category(form) => self.category_dialog(ctx, form),
@@ -627,37 +573,8 @@ impl PennyApp {
         }
     }
 
-    fn data_set_dialog(&mut self, ctx: &egui::Context, form: &mut DataSetForm) -> bool {
-        let others = self.data_sets.clone();
-        match modal(ctx, |ui| form.show(ui, &others)).0 {
-            Outcome::Open => true,
-            Outcome::Cancel => false,
-            Outcome::Save => {
-                let draft = form.draft.clone();
-                self.change(|app| {
-                    app.data_set_id = Some(app.db.save_data_set(&draft)?);
-                    if draft.id == 0 {
-                        app.item_id = None;
-                    }
-                    Ok(())
-                });
-                false
-            }
-            Outcome::Delete => {
-                let has_contents = self.db.count_items_and_sources(form.draft.id).unwrap_or(1) > 0;
-                self.dialog = Some(Dialog::Confirm(Confirm {
-                    question: format!("Delete the {} collection?", form.draft.name),
-                    detail: has_contents.then(|| "Its products, stores and prices will be deleted too.".into()),
-                    button: "Delete",
-                    action: ConfirmAction::DeleteDataSet(form.draft.id),
-                }));
-                false
-            }
-        }
-    }
-
     fn item_dialog(&mut self, ctx: &egui::Context, form: &mut ItemForm) -> bool {
-        let Some(data_set) = self.data_set().cloned() else { return false };
+        let data_set = self.data_set.clone();
         let others = self.items.clone();
         let categories = self.categories.clone();
         match modal(ctx, |ui| form.show(ui, &data_set, &others, &categories)).0 {
@@ -731,7 +648,8 @@ impl PennyApp {
     }
 
     fn history_dialog(&mut self, ctx: &egui::Context, key: PriceKey) -> bool {
-        let (Some(data_set), Some(item)) = (self.data_set().cloned(), self.item().cloned()) else { return false };
+        let Some(item) = self.item().cloned() else { return false };
+        let data_set = self.data_set.clone();
         let source_name =
             self.sources.iter().find(|source| source.id == key.source_id).map(|source| source.name.clone()).unwrap_or_default();
         let product_name = match key.variant_id.and_then(|id| self.variants.iter().find(|variant| variant.id == id)) {
@@ -811,7 +729,6 @@ impl PennyApp {
     }
 
     fn stores_dialog(&mut self, ctx: &egui::Context) -> bool {
-        let Some(data_set_id) = self.data_set_id else { return false };
         let mut edit = None;
         let mut add = false;
         let mut close = false;
@@ -853,14 +770,13 @@ impl PennyApp {
             return false;
         }
         if add {
-            self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source(data_set_id))));
+            self.dialog = Some(Dialog::Source(SourceForm::new(self.new_source())));
             return false;
         }
         !(close || should_close)
     }
 
     fn categories_dialog(&mut self, ctx: &egui::Context) -> bool {
-        let Some(data_set_id) = self.data_set_id else { return false };
         let mut edit = None;
         let mut add = false;
         let mut close = false;
@@ -897,8 +813,7 @@ impl PennyApp {
             return false;
         }
         if add {
-            let category = Category { id: 0, data_set_id, name: String::new() };
-            self.dialog = Some(Dialog::Category(CategoryForm::new(category)));
+            self.dialog = Some(Dialog::Category(CategoryForm::new(self.new_category())));
             return false;
         }
         !(close || should_close)
@@ -932,10 +847,7 @@ impl PennyApp {
     }
 
     fn converter_dialog(&mut self, ctx: &egui::Context, converter: &mut Converter) -> bool {
-        let currency = match self.data_set() {
-            Some(data_set) => data_set.currency(),
-            None => crate::money::currency(crate::money::DEFAULT_CURRENCY),
-        };
+        let currency = self.data_set.currency();
         let (close, should_close) = modal(ctx, |ui| converter.show(ui, currency));
         !(close || should_close)
     }
@@ -943,7 +855,9 @@ impl PennyApp {
     fn settings_dialog(&mut self, ctx: &egui::Context, form: &mut SettingsForm) -> bool {
         match modal(ctx, |ui| form.show(ui)).0 {
             (Outcome::Save, Some(settings)) => {
+                let data_set = form.data_set.clone();
                 self.change(|app| {
+                    app.db.save_data_set(&data_set)?;
                     app.db.save_age_settings(&settings)?;
                     app.age_settings = settings;
                     Ok(())
@@ -976,7 +890,6 @@ impl PennyApp {
         }
 
         match &confirm.action {
-            ConfirmAction::DeleteDataSet(id) => self.change(|app| app.db.delete_data_set(*id)),
             ConfirmAction::DeleteItem(id) => self.change(|app| app.db.delete_item(*id)),
             ConfirmAction::DeleteSource(id) => self.change(|app| app.db.delete_source(*id)),
             ConfirmAction::DeleteCategory(id) => {

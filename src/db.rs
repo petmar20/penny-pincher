@@ -86,6 +86,21 @@ const MIGRATIONS: &[&str] = &[r#"
     DROP INDEX price_item_source;
     CREATE INDEX price_item_source ON price(item_id, source_id, variant_id, modified_at);
     CREATE INDEX price_variant ON price(variant_id);
+"#, r#"
+    -- Collections are gone: the first data_set row now holds the app's currency and units,
+    -- and everything from the others moves into it.
+    UPDATE item SET data_set_id = (SELECT MIN(id) FROM data_set);
+    UPDATE source SET data_set_id = (SELECT MIN(id) FROM data_set);
+    UPDATE category SET data_set_id = (SELECT MIN(id) FROM data_set);
+
+    -- Merge categories that now share a name.
+    UPDATE item SET category_id = (
+        SELECT MIN(same.id) FROM category AS same
+        WHERE same.name = (SELECT name FROM category WHERE id = item.category_id) COLLATE NOCASE
+    ) WHERE category_id IS NOT NULL;
+    DELETE FROM category WHERE id NOT IN (SELECT MIN(id) FROM category GROUP BY name COLLATE NOCASE);
+
+    DELETE FROM data_set WHERE id <> (SELECT MIN(id) FROM data_set);
 "#];
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -143,70 +158,48 @@ impl Db {
         Ok(())
     }
 
-    // Collections
+    // Currency and units
 
-    pub fn data_sets(&self) -> Result<Vec<DataSet>> {
-        let mut statement = self.conn.prepare(
-            "SELECT id, name, currency_code, allow_metric, allow_imperial, allow_us_customary, notes
-             FROM data_set ORDER BY name COLLATE NOCASE",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(DataSet {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                currency_code: row.get(2)?,
-                allow_metric: row.get(3)?,
-                allow_imperial: row.get(4)?,
-                allow_us_customary: row.get(5)?,
-                notes: row.get(6)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Inserts when `id` is 0, otherwise updates. Returns the id.
-    pub fn save_data_set(&self, data_set: &DataSet) -> Result<i64> {
-        let values = params![
-            data_set.name,
-            data_set.currency_code,
-            data_set.allow_metric,
-            data_set.allow_imperial,
-            data_set.allow_us_customary,
-            data_set.notes,
-            data_set.id,
-        ];
-        if data_set.id == 0 {
-            self.conn.execute(
-                "INSERT INTO data_set (name, currency_code, allow_metric, allow_imperial, allow_us_customary, notes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                &values[..6],
-            )?;
-            let id = self.conn.last_insert_rowid();
-            for name in DEFAULT_CATEGORIES {
-                self.save_category(&Category { id: 0, data_set_id: id, name: name.to_string() })?;
-            }
-            Ok(id)
-        } else {
-            self.conn.execute(
-                "UPDATE data_set SET name = ?1, currency_code = ?2, allow_metric = ?3, allow_imperial = ?4,
-                 allow_us_customary = ?5, notes = ?6 WHERE id = ?7",
-                values,
-            )?;
-            Ok(data_set.id)
+    /// The app's currency and unit settings, created with defaults on first run.
+    pub fn data_set(&self) -> Result<DataSet> {
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT id, currency_code, allow_metric, allow_imperial, allow_us_customary FROM data_set ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(DataSet {
+                        id: row.get(0)?,
+                        currency_code: row.get(1)?,
+                        allow_metric: row.get(2)?,
+                        allow_imperial: row.get(3)?,
+                        allow_us_customary: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(data_set) = existing {
+            return Ok(data_set);
         }
+
+        let mut data_set = DataSet::new_default();
+        self.conn.execute(
+            "INSERT INTO data_set (name, currency_code, allow_metric, allow_imperial, allow_us_customary) VALUES ('', ?1, ?2, ?3, ?4)",
+            params![data_set.currency_code, data_set.allow_metric, data_set.allow_imperial, data_set.allow_us_customary],
+        )?;
+        data_set.id = self.conn.last_insert_rowid();
+        for name in DEFAULT_CATEGORIES {
+            self.save_category(&Category { id: 0, data_set_id: data_set.id, name: name.to_string() })?;
+        }
+        Ok(data_set)
     }
 
-    pub fn delete_data_set(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM data_set WHERE id = ?1", [id])?;
+    pub fn save_data_set(&self, data_set: &DataSet) -> Result<()> {
+        self.conn.execute(
+            "UPDATE data_set SET currency_code = ?1, allow_metric = ?2, allow_imperial = ?3, allow_us_customary = ?4 WHERE id = ?5",
+            params![data_set.currency_code, data_set.allow_metric, data_set.allow_imperial, data_set.allow_us_customary, data_set.id],
+        )?;
         Ok(())
-    }
-
-    pub fn count_items_and_sources(&self, data_set_id: i64) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM item WHERE data_set_id = ?1) + (SELECT COUNT(*) FROM source WHERE data_set_id = ?1)",
-            [data_set_id],
-            |row| row.get(0),
-        )?)
     }
 
     // Categories
@@ -553,9 +546,7 @@ pub mod tests {
     use super::*;
 
     pub fn sample(db: &Db) -> (DataSet, Item, Source, Source) {
-        let mut data_set = DataSet::new_default();
-        data_set.name = "Groceries".into();
-        data_set.id = db.save_data_set(&data_set).unwrap();
+        let data_set = db.data_set().unwrap();
         let mut item = Item {
             id: 0,
             data_set_id: data_set.id,
@@ -634,7 +625,7 @@ pub mod tests {
     }
 
     #[test]
-    fn new_collections_get_default_categories() {
+    fn first_run_creates_default_categories() {
         let db = Db::open_in_memory().unwrap();
         let (data_set, ..) = sample(&db);
         let names: Vec<String> = db.categories(data_set.id).unwrap().into_iter().map(|category| category.name).collect();
@@ -665,12 +656,42 @@ pub mod tests {
         let backup = folder.join("backup.db");
 
         let db = Db::open_in_memory().unwrap();
-        sample(&db);
+        let (data_set, item, ..) = sample(&db);
         db.back_up_to(&backup).unwrap();
 
         let mut other = Db::open_in_memory().unwrap();
         other.restore_from(&backup).unwrap();
-        assert_eq!(other.data_sets().unwrap()[0].name, "Groceries");
+        assert_eq!(other.items(data_set.id).unwrap()[0].name, item.name);
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn merges_collections_into_one() {
+        // A database at schema version 2, with two collections that both have Baking.
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..2] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO data_set (id, name, currency_code, allow_metric, allow_imperial, allow_us_customary, notes)
+                 VALUES (1, 'Groceries', 'USD', 1, 0, 1, ''), (2, 'Hardware', 'USD', 1, 0, 1, '');
+             INSERT INTO category (id, data_set_id, name) VALUES (10, 1, 'Baking'), (20, 2, 'Baking'), (21, 2, 'Tools');
+             INSERT INTO item (data_set_id, name, default_unit, allow_multipack, notes, category_id)
+                 VALUES (1, 'Flour', 212, 0, '', 10), (2, 'Yeast', 211, 0, '', 20), (2, 'Hammer', 101, 0, '', 21);
+             INSERT INTO source (data_set_id, name, loyalty_type, loyalty_multiplier, notes) VALUES (2, 'Home Depot', 1, 1.0, '');",
+        )
+        .unwrap();
+
+        let db = Db::from_connection(conn).unwrap();
+        let data_set = db.data_set().unwrap();
+        assert_eq!(data_set.id, 1);
+        let categories: Vec<String> = db.categories(1).unwrap().into_iter().map(|category| category.name).collect();
+        assert_eq!(categories, ["Baking", "Tools"]);
+        let items = db.items(1).unwrap();
+        assert_eq!(items.len(), 3);
+        let yeast = items.iter().find(|item| item.name == "Yeast").unwrap();
+        assert_eq!(yeast.category_id, Some(10));
+        assert_eq!(db.sources(1).unwrap().len(), 1);
     }
 }

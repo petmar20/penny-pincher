@@ -3,28 +3,24 @@
 use crate::money::{self, Currency};
 use crate::units::{QuantityType, Quantity, Unit, UnitFamily};
 
-/// A collection of products and stores that share a currency and units ("Groceries", "Hardware").
+/// The app's currency and units. There's one, and every product, store and category belongs to it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DataSet {
     pub id: i64,
-    pub name: String,
     pub currency_code: String,
     pub allow_metric: bool,
     pub allow_imperial: bool,
     pub allow_us_customary: bool,
-    pub notes: String,
 }
 
 impl DataSet {
     pub fn new_default() -> Self {
         DataSet {
             id: 0,
-            name: String::new(),
             currency_code: money::DEFAULT_CURRENCY.to_string(),
             allow_metric: true,
             allow_imperial: false,
             allow_us_customary: true,
-            notes: String::new(),
         }
     }
 
@@ -76,8 +72,8 @@ impl DataSet {
         }
     }
 
-    /// The unit to show for a stored unit, swapping in an enabled one if the collection's units changed
-    /// since (e.g. imperial pints after switching the collection to metric).
+    /// The unit to show for a stored unit, swapping in an enabled one if the unit settings changed
+    /// since (e.g. imperial pints after switching to metric).
     pub fn usable_unit(&self, unit: Unit) -> Unit {
         let families = self.unit_families();
         if families.iter().any(|family| unit.belongs_to(*family)) {
@@ -106,7 +102,7 @@ impl Item {
     }
 }
 
-/// A group of products within a collection, such as Baking or Home.
+/// A group of products, such as Baking or Home.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Category {
     pub id: i64,

@@ -63,80 +63,6 @@ fn is_name_taken<'a>(name: &str, id: i64, others: impl IntoIterator<Item = (i64,
         .any(|(other_id, other_name)| other_id != id && other_name.trim().eq_ignore_ascii_case(name.trim()))
 }
 
-// Collections
-
-pub struct DataSetForm {
-    pub draft: DataSet,
-    pub error: Option<String>,
-}
-
-impl DataSetForm {
-    pub fn new(data_set: DataSet) -> Self {
-        DataSetForm { draft: data_set, error: None }
-    }
-
-    pub fn show(&mut self, ui: &mut Ui, others: &[DataSet]) -> Outcome {
-        let is_new = self.draft.id == 0;
-        ui.heading(if is_new { "New collection" } else { "Edit collection" });
-        ui.add_space(6.0);
-        egui::Grid::new("data_set_form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Name");
-            name_field(ui, &mut self.draft.name);
-            ui.end_row();
-
-            ui.label("Currency");
-            egui::ComboBox::from_id_salt("currency")
-                .selected_text(self.draft.currency_code.as_str())
-                .show_ui(ui, |ui| {
-                    for currency in CURRENCIES {
-                        ui.selectable_value(&mut self.draft.currency_code, currency.code.to_string(), currency.code);
-                    }
-                });
-            ui.end_row();
-
-            ui.label("Units");
-            ui.vertical(|ui| {
-                ui.checkbox(&mut self.draft.allow_us_customary, "US (oz, lb, fl oz, gal)");
-                ui.checkbox(&mut self.draft.allow_metric, "Metric (g, kg, ml, L)");
-                ui.checkbox(&mut self.draft.allow_imperial, "Imperial (UK pints and gallons)");
-            });
-            ui.end_row();
-
-            ui.label("Notes");
-            notes_field(ui, &mut self.draft.notes);
-            ui.end_row();
-        });
-        error_text(ui, &self.error);
-
-        let outcome = buttons(ui, !is_new, "Delete collection");
-        if matches!(outcome, Outcome::Save) {
-            self.error = self.validate(others);
-            if self.error.is_some() {
-                return Outcome::Open;
-            }
-            self.draft.name = self.draft.name.trim().to_string();
-        }
-        outcome
-    }
-
-    fn validate(&self, others: &[DataSet]) -> Option<String> {
-        let draft = &self.draft;
-        if draft.name.trim().is_empty() {
-            return Some("Enter a name.".into());
-        }
-        if is_name_taken(&draft.name, draft.id, others.iter().map(|other| (other.id, other.name.as_str()))) {
-            return Some("There's already a collection with this name.".into());
-        }
-        if !draft.allow_metric && !draft.allow_imperial && !draft.allow_us_customary {
-            return Some("Pick at least one kind of unit.".into());
-        }
-        if draft.allow_imperial && draft.allow_us_customary {
-            return Some("US and imperial units can't be used together.".into());
-        }
-        None
-    }
-}
-
 // Products
 
 pub struct ItemForm {
@@ -710,6 +636,7 @@ pub fn judgement_badge(ui: &mut Ui, judgement: Judgement) {
 // Settings
 
 pub struct SettingsForm {
+    pub data_set: DataSet,
     stale: String,
     ancient: String,
     inflation: String,
@@ -717,8 +644,9 @@ pub struct SettingsForm {
 }
 
 impl SettingsForm {
-    pub fn new(settings: &AgeSettings) -> Self {
+    pub fn new(data_set: &DataSet, settings: &AgeSettings) -> Self {
         SettingsForm {
+            data_set: data_set.clone(),
             stale: settings.stale_after_days.to_string(),
             ancient: settings.ancient_after_days.to_string(),
             inflation: format_number(settings.annual_inflation_percent, 2),
@@ -729,6 +657,23 @@ impl SettingsForm {
     pub fn show(&mut self, ui: &mut Ui) -> (Outcome, Option<AgeSettings>) {
         ui.heading("Settings");
         ui.add_space(6.0);
+
+        ui.label(RichText::new("Currency").strong());
+        egui::ComboBox::from_id_salt("currency")
+            .selected_text(self.data_set.currency_code.as_str())
+            .show_ui(ui, |ui| {
+                for currency in CURRENCIES {
+                    ui.selectable_value(&mut self.data_set.currency_code, currency.code.to_string(), currency.code);
+                }
+            });
+        ui.add_space(6.0);
+
+        ui.label(RichText::new("Units").strong());
+        ui.checkbox(&mut self.data_set.allow_us_customary, "US (oz, lb, fl oz, gal)");
+        ui.checkbox(&mut self.data_set.allow_metric, "Metric (g, kg, ml, L)");
+        ui.checkbox(&mut self.data_set.allow_imperial, "Imperial (UK pints and gallons)");
+        ui.add_space(6.0);
+
         let setting = |ui: &mut Ui, label: &str, hint: &str, value: &mut String, suffix: &str| {
             ui.label(RichText::new(label).strong());
             ui.weak(hint);
@@ -756,6 +701,13 @@ impl SettingsForm {
     }
 
     fn parse(&self) -> Result<AgeSettings, String> {
+        let units = &self.data_set;
+        if !units.allow_metric && !units.allow_imperial && !units.allow_us_customary {
+            return Err("Pick at least one kind of unit.".into());
+        }
+        if units.allow_imperial && units.allow_us_customary {
+            return Err("US and imperial units can't be used together.".into());
+        }
         let whole_days = |text: &str| parse_number(text).filter(|days| *days >= 1.0 && days.fract() == 0.0).map(|days| days as i64);
         let stale = whole_days(&self.stale).ok_or("Old prices needs a whole number of days.")?;
         let ancient = whole_days(&self.ancient).ok_or("Very old prices needs a whole number of days.")?;
